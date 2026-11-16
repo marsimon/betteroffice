@@ -1354,7 +1354,9 @@ impl EditingDoc {
         #[cfg(test)]
         TABLE_EMBED_SCANS.with(|scans| scans.set(scans.get() + 1));
         let embeds = Arc::new(ops::table::table_embeds_in(story, txn));
-        cache.stories.insert(story_id.to_owned(), Arc::clone(&embeds));
+        cache
+            .stories
+            .insert(story_id.to_owned(), Arc::clone(&embeds));
         embeds
     }
 

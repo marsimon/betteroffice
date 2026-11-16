@@ -14353,7 +14353,7 @@ pub fn build_display_list_value_from_resident_incremental_with_fonts(
     previous: &DisplayList,
     rebuilt_page_start: usize,
     rebuilt_page_end: usize,
-    position_deltas: &HashMap<String, i64>,
+    position_deltas: &PositionDeltas,
 ) -> Result<DisplayList, String> {
     let parsed = resident_build_input(pagination, layout, extras)?;
     if previous.pages.len() != parsed.layout.pages.len()
@@ -14404,7 +14404,7 @@ pub fn update_display_list_value_from_resident_incremental_with_fonts(
     previous: &mut DisplayList,
     rebuilt_page_start: usize,
     rebuilt_page_end: usize,
-    position_deltas: &HashMap<String, i64>,
+    position_deltas: &PositionDeltas,
 ) -> Result<bool, String> {
     update_display_list_value_from_resident_incremental_with_fonts_observed(
         pagination,
@@ -14427,7 +14427,7 @@ pub fn update_display_list_value_from_resident_incremental_with_fonts_observed(
     previous: &mut DisplayList,
     rebuilt_page_start: usize,
     rebuilt_page_end: usize,
-    position_deltas: &HashMap<String, i64>,
+    position_deltas: &PositionDeltas,
     observe_phase: &mut impl FnMut(),
 ) -> Result<bool, String> {
     let parsed = resident_build_input(pagination, layout, extras)?;
@@ -14472,7 +14472,7 @@ pub fn update_resident_display_list_incremental_with_fonts_observed(
     rebuilt_page_start: usize,
     rebuilt_page_end: usize,
     extra_pages: &[usize],
-    position_deltas: &HashMap<String, i64>,
+    position_deltas: &PositionDeltas,
     observe_phase: &mut impl FnMut(),
 ) -> Result<bool, String> {
     update_resident_display_list_incremental_partial_with_fonts_observed(
@@ -14503,7 +14503,7 @@ pub fn update_resident_display_list_incremental_partial_with_fonts_observed(
     rebuilt_page_start: usize,
     rebuilt_page_end: usize,
     extra_pages: &[usize],
-    position_deltas: &HashMap<String, i64>,
+    position_deltas: &PositionDeltas,
     build: &dyn Fn(usize) -> bool,
     observe_phase: &mut impl FnMut(),
 ) -> Result<bool, String> {
@@ -14580,7 +14580,7 @@ pub fn update_resident_display_list_incremental_partial_with_fonts_shifts(
     rebuilt_page_start: usize,
     rebuilt_page_end: usize,
     extra_pages: &[usize],
-    position_deltas: &HashMap<String, i64>,
+    position_deltas: &PositionDeltas,
     build: &dyn Fn(usize) -> bool,
     observe_phase: &mut impl FnMut(),
 ) -> Result<Option<IncrementalDisplayShifts>, String> {
@@ -14611,7 +14611,7 @@ pub fn update_resident_display_list_incremental_partial_with_fonts_cached(
     rebuilt_page_start: usize,
     rebuilt_page_end: usize,
     extra_pages: &[usize],
-    position_deltas: &HashMap<String, i64>,
+    position_deltas: &PositionDeltas,
     build: &dyn Fn(usize) -> bool,
     observe_phase: &mut impl FnMut(),
     fingerprints: Option<&[u128]>,
@@ -14944,11 +14944,112 @@ impl DisplayShift {
     }
 }
 
+/// How far retained blocks' document positions moved, by block key: keys given
+/// one by one, and one delta that a shared set of keys takes. Keystrokes in one
+/// paragraph move every block after it alike, so they share the set instead of
+/// listing each later block again.
+#[derive(Clone, Debug, Default)]
+pub struct PositionDeltas {
+    keys: HashMap<String, i64>,
+    shared: Option<(std::sync::Arc<HashSet<String>>, i64)>,
+}
+
+impl PositionDeltas {
+    /// Deltas given key by key.
+    pub fn from_keys(keys: HashMap<String, i64>) -> Self {
+        Self { keys, shared: None }
+    }
+
+    /// `delta` for every key of `keys`.
+    pub fn shared(keys: std::sync::Arc<HashSet<String>>, delta: i64) -> Self {
+        Self {
+            keys: HashMap::new(),
+            shared: Some((keys, delta)),
+        }
+    }
+
+    /// The delta of `key`, when it has one.
+    pub fn get(&self, key: &str) -> Option<i64> {
+        let own = self.keys.get(key).copied();
+        let shared = self
+            .shared
+            .as_ref()
+            .filter(|(keys, _)| keys.contains(key))
+            .map(|(_, delta)| *delta);
+        match (own, shared) {
+            (None, None) => None,
+            // `add` keeps every sum in range
+            (own, shared) => Some(own.unwrap_or(0) + shared.unwrap_or(0)),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.shared.as_ref().is_none_or(|(keys, _)| keys.is_empty())
+    }
+
+    pub fn clear(&mut self) {
+        self.keys.clear();
+        self.shared = None;
+    }
+
+    /// Adds `other` to these deltas. `false` when a sum leaves `i64`, which
+    /// leaves them partly added.
+    pub fn add(&mut self, other: PositionDeltas) -> bool {
+        let PositionDeltas { keys, shared } = other;
+        if let Some((keys, delta)) = shared {
+            match &mut self.shared {
+                None => self.shared = Some((keys, delta)),
+                Some((own, own_delta)) if std::sync::Arc::ptr_eq(own, &keys) => {
+                    match own_delta.checked_add(delta) {
+                        Some(sum) => *own_delta = sum,
+                        None => return false,
+                    }
+                }
+                Some(_) => {
+                    for key in keys.iter() {
+                        if !self.add_key(key.clone(), delta) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        for (key, delta) in keys {
+            if !self.add_key(key, delta) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn add_key(&mut self, key: String, delta: i64) -> bool {
+        let shared = self
+            .shared
+            .as_ref()
+            .filter(|(keys, _)| keys.contains(&key))
+            .map_or(0, |(_, delta)| *delta);
+        let pending = self.keys.entry(key).or_default();
+        match pending.checked_add(delta) {
+            Some(sum) if sum.checked_add(shared).is_some() => {
+                *pending = sum;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl From<HashMap<String, i64>> for PositionDeltas {
+    fn from(keys: HashMap<String, i64>) -> Self {
+        Self::from_keys(keys)
+    }
+}
+
 /// Moves an unbuilt page's position span with the blocks `layout_page` places.
 fn shift_unbuilt_span(
     page: &mut DisplayPage,
     layout_page: Option<&crate::types::Page>,
-    deltas: &HashMap<String, i64>,
+    deltas: &PositionDeltas,
 ) -> DisplayShift {
     let Some(span) = &mut page.position_span else {
         return DisplayShift::Inert;
@@ -14962,8 +15063,8 @@ fn shift_unbuilt_span(
         })
         .map(resident_fragment_block_key)
         .and_then(|key| deltas.get(key.as_ref()))
-        .filter(|&&delta| delta != 0);
-    if let Some(&delta) = delta {
+        .filter(|&delta| delta != 0);
+    if let Some(delta) = delta {
         span[0] += delta;
         span[1] += delta;
         DisplayShift::Uniform(delta)
@@ -14973,10 +15074,7 @@ fn shift_unbuilt_span(
 }
 
 /// Shifts body positions and classifies the deltas applied to positioned primitives.
-fn shift_page_body_positions(
-    page: &mut DisplayPage,
-    deltas: &HashMap<String, i64>,
-) -> DisplayShift {
+fn shift_page_body_positions(page: &mut DisplayPage, deltas: &PositionDeltas) -> DisplayShift {
     // Looked up by reference: a clone per primitive is an allocation per
     // primitive on every page after the edit.
     let mut id_key = String::new();
@@ -15012,9 +15110,9 @@ fn shift_page_body_positions(
             }
             (None, None) => None,
         };
-        let Some(&delta) = key
+        let Some(delta) = key
             .and_then(|key| deltas.get(key))
-            .filter(|&&delta| delta != 0)
+            .filter(|&delta| delta != 0)
         else {
             shift = shift.combine(DisplayShift::Unchanged);
             continue;
@@ -16138,7 +16236,7 @@ mod tests {
                 }
             }
             layout.pages[1].body_margins.as_mut().unwrap().top += 4.0;
-            let deltas = HashMap::from([("50".to_owned(), 3)]);
+            let deltas = PositionDeltas::from(HashMap::from([("50".to_owned(), 3)]));
             let suffix_span = list.pages[2].position_span.unwrap();
             let refresh = |resident: &mut ResidentDisplayInput, list: &mut DisplayList| {
                 update_resident_display_list_incremental_partial_with_fonts_observed(
@@ -16269,14 +16367,14 @@ mod tests {
             shift_unbuilt_span(
                 &mut page,
                 Some(&layout.pages[0]),
-                &HashMap::from([(key.clone(), 7)]),
+                &PositionDeltas::from(HashMap::from([(key.clone(), 7)])),
             );
             assert_eq!(page.position_span, Some([17, 27]));
             let missing = if key == "0" { "unplaced" } else { "0" };
             shift_unbuilt_span(
                 &mut page,
                 Some(&layout.pages[0]),
-                &HashMap::from([(missing.to_owned(), 9)]),
+                &PositionDeltas::from(HashMap::from([(missing.to_owned(), 9)])),
             );
             assert_eq!(page.position_span, Some([17, 27]));
         }
@@ -16555,7 +16653,7 @@ mod tests {
                 0,
                 layout.pages.len(),
                 &[],
-                &HashMap::new(),
+                &PositionDeltas::default(),
                 &|index| index == 0,
                 &mut || {},
             )
@@ -16714,11 +16812,11 @@ mod tests {
             ]
         }))
         .unwrap();
-        let deltas = HashMap::from([
+        let deltas = PositionDeltas::from(HashMap::from([
             ("b1".to_owned(), 3),
             ("7".to_owned(), -2),
             ("7.5".to_owned(), 4),
-        ]);
+        ]));
         shift_page_body_positions(&mut page, &deltas);
         let positions: Vec<_> = page
             .primitives
@@ -16765,7 +16863,8 @@ mod tests {
             "inlineSdtWidget": {"kind": "checkbox", "groupId": "widget", "pos": 7}
         }))
         .unwrap();
-        let deltas = HashMap::from([("a".to_owned(), 3), ("b".to_owned(), -2)]);
+        let deltas =
+            PositionDeltas::from(HashMap::from([("a".to_owned(), 3), ("b".to_owned(), -2)]));
         for (attrs, expected) in [
             (
                 vec![positioned(Some("a"), 10), widget],
@@ -16804,7 +16903,7 @@ mod tests {
             }
             assert_eq!(shift_page_body_positions(&mut page, &deltas), expected);
             assert_eq!(
-                shift_page_body_positions(&mut page, &HashMap::new()),
+                shift_page_body_positions(&mut page, &PositionDeltas::default()),
                 if expected == DisplayShift::Inert {
                     DisplayShift::Inert
                 } else {
@@ -16821,7 +16920,7 @@ mod tests {
             "pageIndex": 0, "width": 816, "height": 1056, "primitives": [], "unbuilt": true
         }))
         .unwrap();
-        let deltas = HashMap::from([("a".to_owned(), 3)]);
+        let deltas = PositionDeltas::from(HashMap::from([("a".to_owned(), 3)]));
         assert_eq!(
             shift_unbuilt_span(&mut page, None, &deltas),
             DisplayShift::Inert
@@ -18550,7 +18649,7 @@ mod tests {
                     0,
                     1,
                     &[],
-                    &HashMap::new(),
+                    &PositionDeltas::default(),
                     &mut || {},
                 )
                 .unwrap()

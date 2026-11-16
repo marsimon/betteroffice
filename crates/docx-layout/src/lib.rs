@@ -391,7 +391,7 @@ pub fn build_display_list_value_from_resident_incremental(
     previous: &display_list::DisplayList,
     rebuilt_page_start: usize,
     rebuilt_page_end: usize,
-    position_deltas: &std::collections::HashMap<String, i64>,
+    position_deltas: &crate::display_list::PositionDeltas,
 ) -> Result<display_list::DisplayList, String> {
     with_measure_fonts(|store| {
         display_list::build_display_list_value_from_resident_incremental_with_fonts(
@@ -415,7 +415,7 @@ pub fn update_display_list_value_from_resident_incremental(
     previous: &mut display_list::DisplayList,
     rebuilt_page_start: usize,
     rebuilt_page_end: usize,
-    position_deltas: &std::collections::HashMap<String, i64>,
+    position_deltas: &crate::display_list::PositionDeltas,
 ) -> Result<bool, String> {
     with_measure_fonts(|store| {
         display_list::update_display_list_value_from_resident_incremental_with_fonts(
@@ -438,7 +438,7 @@ pub fn update_display_list_value_from_resident_incremental_observed(
     previous: &mut display_list::DisplayList,
     rebuilt_page_start: usize,
     rebuilt_page_end: usize,
-    position_deltas: &std::collections::HashMap<String, i64>,
+    position_deltas: &crate::display_list::PositionDeltas,
     observe_phase: &mut impl FnMut(),
 ) -> Result<bool, String> {
     with_measure_fonts(|store| {
@@ -466,7 +466,7 @@ pub fn update_resident_display_list_incremental_observed(
     rebuilt_page_start: usize,
     rebuilt_page_end: usize,
     extra_pages: &[usize],
-    position_deltas: &std::collections::HashMap<String, i64>,
+    position_deltas: &crate::display_list::PositionDeltas,
     observe_phase: &mut impl FnMut(),
 ) -> Result<bool, String> {
     with_measure_fonts(|store| {
@@ -496,7 +496,7 @@ pub fn update_resident_display_list_incremental_partial_observed(
     rebuilt_page_start: usize,
     rebuilt_page_end: usize,
     extra_pages: &[usize],
-    position_deltas: &std::collections::HashMap<String, i64>,
+    position_deltas: &crate::display_list::PositionDeltas,
     build: &dyn Fn(usize) -> bool,
     observe_phase: &mut impl FnMut(),
 ) -> Result<bool, String> {
@@ -527,7 +527,7 @@ pub fn update_resident_display_list_incremental_partial_shifts_observed(
     rebuilt_page_start: usize,
     rebuilt_page_end: usize,
     extra_pages: &[usize],
-    position_deltas: &std::collections::HashMap<String, i64>,
+    position_deltas: &crate::display_list::PositionDeltas,
     build: &dyn Fn(usize) -> bool,
     observe_phase: &mut impl FnMut(),
 ) -> Result<Option<display_list::IncrementalDisplayShifts>, String> {
@@ -558,7 +558,7 @@ pub fn update_resident_display_list_incremental_partial_cached_shifts_observed(
     rebuilt_page_start: usize,
     rebuilt_page_end: usize,
     extra_pages: &[usize],
-    position_deltas: &std::collections::HashMap<String, i64>,
+    position_deltas: &crate::display_list::PositionDeltas,
     build: &dyn Fn(usize) -> bool,
     observe_phase: &mut impl FnMut(),
     fingerprints: &[u128],

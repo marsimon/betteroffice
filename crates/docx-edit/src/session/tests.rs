@@ -390,9 +390,19 @@ fn a_table_cell_caret_comes_from_the_resident_layout() {
         .unwrap();
     let payload: Value =
         serde_json::from_str(&session.table_payload("body", 0).unwrap().unwrap()).unwrap();
-    let cell = payload["rows"][0]["cells"][1]["story"].as_str().unwrap().to_owned();
+    let cell = payload["rows"][0]["cells"][1]["story"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     session
-        .insert_text(&cell, &paragraph_id(&session, &cell), 0, "Cell text", None, None)
+        .insert_text(
+            &cell,
+            &paragraph_id(&session, &cell),
+            0,
+            "Cell text",
+            None,
+            None,
+        )
         .unwrap();
     let cell_para = paragraph_id(&session, &cell);
     let font = session
@@ -435,7 +445,10 @@ fn a_table_cell_caret_comes_from_the_resident_layout() {
             .unwrap();
         let caret: Value =
             serde_json::from_str(&session.resident_caret_snapshot_json().unwrap()).unwrap();
-        assert!(caret["caretRect"].is_object(), "a collapsed cell caret has geometry: {caret}");
+        assert!(
+            caret["caretRect"].is_object(),
+            "a collapsed cell caret has geometry: {caret}"
+        );
         caret["caretRect"].clone()
     };
     let start = caret_at(0);

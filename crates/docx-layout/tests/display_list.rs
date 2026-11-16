@@ -3476,7 +3476,7 @@ fn unbuilt_page_spans_read_positions_as_a_fresh_build_does() {
             0,
             layout.pages.len(),
             &[],
-            &std::collections::HashMap::new(),
+            &docx_layout::display_list::PositionDeltas::default(),
             &unbuilt,
             &mut || {},
         );

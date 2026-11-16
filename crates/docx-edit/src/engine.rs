@@ -7,7 +7,7 @@ use std::hash::{DefaultHasher, Hasher as _};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use docx_layout::display_list::DisplayList;
+use docx_layout::display_list::{DisplayList, PositionDeltas};
 use docx_layout::endnote_flow::{
     EndnoteFlow, attach_flowed_endnote_areas, flow_column_width, flow_endnotes, flow_target_page,
     flows_with_body, remove_flowed, take_flowed_fragments,
@@ -2351,7 +2351,7 @@ struct PaginationState {
     display_layout_pending: bool,
     display_uses_region_path: bool,
     display_full_rebuild: bool,
-    position_deltas: HashMap<String, i64>,
+    position_deltas: PositionDeltas,
     last_incremental: bool,
     /// Pages whose stamps changed since the last display build, when known.
     restamped_pages: Option<BTreeSet<usize>>,
@@ -2688,6 +2688,7 @@ pub struct EngineSession {
     /// Resident text edits re-lower only their paragraph when eligible.
     local_lowering: Cell<bool>,
     float_kinds: RefCell<FloatKindsMemo>,
+    moved_keys: RefCell<MovedKeys>,
     /// Body heading levels by paragraph id, for the document version they were read at.
     /// The body's headings, by the document version and body revision they were read at.
     page_text_headings: RefCell<Option<(PageTextHeadingsRead, Rc<HashMap<String, u8>>)>>,
@@ -2998,7 +2999,11 @@ fn resident_paragraph_position(input: &LayoutInput, para_id: &str, offset: u32) 
 
 /// [`resident_paragraph_position`] for a paragraph of a table cell, nested tables included: the
 /// first block lowered from `para_id`, under the same plain-runs rule.
-fn resident_cell_paragraph_position(input: &LayoutInput, para_id: &str, offset: u32) -> Option<i64> {
+fn resident_cell_paragraph_position(
+    input: &LayoutInput,
+    para_id: &str,
+    offset: u32,
+) -> Option<i64> {
     fn start_of(block: &LayoutBlock, para_id: &str) -> Option<Option<f64>> {
         match block {
             LayoutBlock::Table(table) => table
@@ -4555,32 +4560,95 @@ fn nested_block_keys(block: &LayoutBlock, out: &mut Vec<String>) {
     }
 }
 
-fn position_deltas(previous_input: &LayoutInput, next_input: &LayoutInput) -> HashMap<String, i64> {
+/// The keys of the blocks that moved alike from `from` on, with the blocks'
+/// fingerprints they were read at. Keystrokes in one paragraph move the same
+/// blocks, so the next keystroke shares the keys instead of reading them again.
+#[derive(Default)]
+struct MovedKeys {
+    from: usize,
+    moved: Vec<bool>,
+    fingerprints: Vec<Fingerprint>,
+    keys: Arc<HashSet<String>>,
+}
+
+/// The key `next` keeps from `previous`, and how far it moved, when it moved.
+fn moved_block<'a>(
+    previous: &MeasuredBlock,
+    next: &'a MeasuredBlock,
+) -> Option<(Cow<'a, str>, i64)> {
+    let previous_id = previous.block.block_id()?;
+    let next_id = next.block.block_id()?;
+    let key = block_key(next_id);
+    if key != block_key(previous_id) {
+        return None;
+    }
+    let delta = next.block.pm_start()? as i64 - previous.block.pm_start()? as i64;
+    (delta != 0).then_some((key, delta))
+}
+
+/// How far each block of `next_input` moved from `previous_input`, by key.
+/// With `moved_keys`, blocks that all moved alike share the keys read for the
+/// last edit while `next_fingerprints` still hold for them.
+fn position_deltas(
+    previous_input: &LayoutInput,
+    next_input: &LayoutInput,
+    next_fingerprints: Option<&[Fingerprint]>,
+    moved_keys: Option<&RefCell<MovedKeys>>,
+) -> PositionDeltas {
+    let blocks = || previous_input.measured.iter().zip(&next_input.measured);
+    let mut shared = None;
+    let mut moved = Vec::new();
+    for (index, (previous, next)) in blocks().enumerate() {
+        let delta = moved_block(previous, next).map(|(_, delta)| delta);
+        match (shared, delta) {
+            (None, None) => {}
+            (None, Some(delta)) => {
+                shared = Some((index, delta));
+                moved.reserve(next_input.measured.len() - index);
+                moved.push(true);
+            }
+            (Some((_, alike)), delta) => {
+                if delta.is_some_and(|delta| delta != alike) {
+                    shared = None;
+                    break;
+                }
+                moved.push(delta.is_some());
+            }
+        }
+    }
+    if let (Some((from, delta)), Some(fingerprints), Some(memo)) =
+        (shared, next_fingerprints, moved_keys)
+        && fingerprints.len() == next_input.measured.len()
+    {
+        let mut memo = memo.borrow_mut();
+        if memo.from != from || memo.moved != moved || memo.fingerprints != fingerprints[from..] {
+            let mut keys = HashSet::new();
+            let mut nested = Vec::new();
+            for ((previous, next), _) in
+                blocks().skip(from).zip(&moved).filter(|(_, moved)| **moved)
+            {
+                let (key, _) = moved_block(previous, next).expect("a moved block has a delta");
+                keys.insert(key.into_owned());
+                nested_block_keys(&next.block, &mut nested);
+                keys.extend(nested.drain(..));
+            }
+            #[cfg(test)]
+            MOVED_KEY_READS.with(|reads| reads.set(reads.get() + 1));
+            *memo = MovedKeys {
+                from,
+                moved,
+                fingerprints: fingerprints[from..].to_vec(),
+                keys: Arc::new(keys),
+            };
+        }
+        return PositionDeltas::shared(Arc::clone(&memo.keys), delta);
+    }
     let mut deltas = HashMap::new();
     let mut nested = Vec::new();
-    let blocks = previous_input.measured.iter().zip(&next_input.measured);
-    for (index, (previous, next)) in blocks.enumerate() {
-        let (Some(previous_id), Some(next_id)) = (previous.block.block_id(), next.block.block_id())
-        else {
+    for (previous, next) in blocks() {
+        let Some((key, delta)) = moved_block(previous, next) else {
             continue;
         };
-        let key = block_key(previous_id);
-        if key != block_key(next_id) {
-            continue;
-        }
-        let (Some(previous_start), Some(next_start)) =
-            (previous.block.pm_start(), next.block.pm_start())
-        else {
-            continue;
-        };
-        let delta = next_start as i64 - previous_start as i64;
-        if delta == 0 {
-            continue;
-        }
-        if deltas.is_empty() {
-            // the first moved block usually moves every block after it
-            deltas.reserve(next_input.measured.len().saturating_sub(index));
-        }
         deltas.insert(key.into_owned(), delta);
         // Nested paragraphs (table cells, text boxes, shape text) carry
         // their own ids on display primitives but shift with the
@@ -4588,7 +4656,12 @@ fn position_deltas(previous_input: &LayoutInput, next_input: &LayoutInput) -> Ha
         nested_block_keys(&next.block, &mut nested);
         deltas.extend(nested.drain(..).map(|key| (key, delta)));
     }
-    deltas
+    PositionDeltas::from_keys(deltas)
+}
+
+#[cfg(test)]
+thread_local! {
+    static MOVED_KEY_READS: Cell<usize> = const { Cell::new(0) };
 }
 
 fn incremental_eligible_plain(
@@ -5397,6 +5470,7 @@ impl EngineSession {
             partial_document: Cell::new(false),
             local_lowering: Cell::new(false),
             float_kinds: RefCell::default(),
+            moved_keys: RefCell::default(),
             page_text_headings: RefCell::new(None),
             #[cfg(test)]
             preview_refresh: Cell::new(true),
@@ -9394,7 +9468,7 @@ impl EngineSession {
                     .borrow()
                     .input
                     .as_ref()
-                    .map(|previous| position_deltas(previous, &final_input))
+                    .map(|previous| position_deltas(previous, &final_input, None, None))
                     .unwrap_or_default();
                 if let Some(pass) = pass {
                     let input_options_fingerprint = options_fingerprint(&final_input)?;
@@ -10445,7 +10519,7 @@ impl EngineSession {
             .as_ref()
             .map(|layout| layout.pages.len());
         let mut incremental = false;
-        let mut deltas = HashMap::new();
+        let mut deltas = PositionDeltas::default();
         let run = {
             let mut previous = self.pagination.borrow_mut();
             self.prepare_placement_fingerprints(
@@ -10503,6 +10577,8 @@ impl EngineSession {
                 deltas = position_deltas(
                     previous.input.as_ref().expect("eligibility checked input"),
                     &input,
+                    Some(&block_fingerprints),
+                    Some(&self.moved_keys),
                 );
                 let attempted = docx_layout::place::layout_document_incremental_ranges(
                     &mut input,
@@ -10549,7 +10625,7 @@ impl EngineSession {
         revision_preview: Option<(u64, &BTreeMap<String, RevisionPreview>, bool)>,
         cached_page_totals: bool,
         run: docx_layout::place::IncrementalLayout,
-        (incremental, deltas, previous_page_count): (bool, HashMap<String, i64>, Option<usize>),
+        (incremental, deltas, previous_page_count): (bool, PositionDeltas, Option<usize>),
         input_options_fingerprint: u64,
         trigger: RelayoutTrigger,
     ) -> Result<(), String> {
@@ -10613,15 +10689,8 @@ impl EngineSession {
                             .extend(state.rebuilt_page_ranges.iter().flat_map(Clone::clone));
                     }
                 }
-                for (key, delta) in deltas {
-                    let pending = state.position_deltas.entry(key).or_default();
-                    match pending.checked_add(delta) {
-                        Some(delta) => *pending = delta,
-                        None => {
-                            state.display_full_rebuild = true;
-                            break;
-                        }
-                    }
+                if !state.position_deltas.add(deltas) {
+                    state.display_full_rebuild = true;
                 }
             }
             pagination.limit_display_damage();
@@ -21476,6 +21545,7 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
         let mut retained = HashMap::new();
         assert_certified_float_cold(&engine, &request, &mut retained);
         let mut typed = 0;
+        let mut moved_reads = 0;
         for text in ["x", "y", "z"] {
             // before every table, so each one moves
             let offset = engine
@@ -21493,15 +21563,17 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
                     true,
                 )
                 .unwrap();
-            let before = classified();
+            let before = (classified(), MOVED_KEY_READS.with(Cell::get));
             engine
                 .layout_document_with_regions_after_edit(&request, Some("body"))
                 .unwrap();
-            typed += classified() - before;
+            typed += classified() - before.0;
+            moved_reads += MOVED_KEY_READS.with(Cell::get) - before.1;
             // the cold session classifies its own
             assert_certified_float_cold(&engine, &request, &mut retained);
         }
         assert_eq!(typed, 0, "moved tables keep their kinds");
+        assert_eq!(moved_reads, 1, "later keystrokes share the moved keys");
     }
 
     #[test]
@@ -21524,9 +21596,10 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
         let (mut layout_input, regions, _, _, _, _) = input.split();
         apply_section_geometry(&mut layout_input, &regions);
         let geometry = initial_float_page_geometry(&layout_input, &regions);
-        let measurement: docx_layout::measure_blocks::MeasurementConfig =
-            serde_json::from_value(serde_json::from_str::<serde_json::Value>(&request).unwrap()["measurement"].clone())
-                .unwrap();
+        let measurement: docx_layout::measure_blocks::MeasurementConfig = serde_json::from_value(
+            serde_json::from_str::<serde_json::Value>(&request).unwrap()["measurement"].clone(),
+        )
+        .unwrap();
         let policy = FloatWidthPolicy::for_document(blocks.iter());
         let kinds = |blocks: &SharedBlocks| {
             let before = FLOAT_TABLE_CLASSIFICATIONS.with(Cell::get);
@@ -21555,7 +21628,11 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
         table.width = Some(table.width.unwrap_or(1800.0) / 2.0);
         assert_eq!(kinds(&changed), ((true, false), 1));
         assert_eq!(kinds(&changed), ((true, false), 0));
-        assert_eq!(kinds(&blocks), ((true, false), 1), "only the kinds in use are kept");
+        assert_eq!(
+            kinds(&blocks),
+            ((true, false), 1),
+            "only the kinds in use are kept"
+        );
     }
 
     #[test]
@@ -25438,10 +25515,79 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
         };
         let mut next = previous.clone();
         crate::bridge::local::shift_block(&mut next.measured[0].block, 7);
-        let deltas = position_deltas(&previous, &next);
+        let deltas = position_deltas(&previous, &next, None, None);
         for key in std::iter::once("outer").chain(keys.iter().map(String::as_str)) {
-            assert_eq!(deltas.get(key), Some(&7), "{key}");
+            assert_eq!(deltas.get(key), Some(7), "{key}");
         }
+        let fingerprints = measured_fingerprints(&next).unwrap();
+        let moved = RefCell::default();
+        let shared = position_deltas(&previous, &next, Some(&fingerprints), Some(&moved));
+        for key in std::iter::once("outer").chain(keys.iter().map(String::as_str)) {
+            assert_eq!(shared.get(key), Some(7), "{key}");
+        }
+        assert_eq!(shared.get("absent"), None);
+    }
+
+    #[test]
+    fn blocks_moved_alike_share_their_keys_until_one_changes() {
+        let paragraph = |id: &str, start: u64| {
+            serde_json::from_value::<LayoutBlock>(json!({
+                "kind": "paragraph", "id": id, "pmStart": start, "pmEnd": start + 5,
+                "runs": [{ "kind": "text", "text": "Text", "pmStart": start + 1, "pmEnd": start + 5 }]
+            }))
+            .unwrap()
+        };
+        let input = |starts: [u64; 4], last: &str| LayoutInput {
+            measured: ["a", "b", "c", last]
+                .into_iter()
+                .zip(starts)
+                .map(|(id, start)| MeasuredBlock {
+                    block: paragraph(id, start),
+                    measure: BlockExtent::Unsupported,
+                })
+                .collect(),
+            options: Default::default(),
+        };
+        let reads = || MOVED_KEY_READS.with(Cell::get);
+        let moved = RefCell::default();
+        let deltas = |previous: &LayoutInput, next: &LayoutInput| {
+            let fingerprints = measured_fingerprints(next).unwrap();
+            let before = reads();
+            let deltas = position_deltas(previous, next, Some(&fingerprints), Some(&moved));
+            let explicit = position_deltas(previous, next, None, None);
+            for key in ["a", "b", "c", "d", "e"] {
+                assert_eq!(deltas.get(key), explicit.get(key), "{key}");
+            }
+            (deltas, reads() - before)
+        };
+        // typing in the first block moves the rest alike
+        let first = input([0, 10, 20, 30], "d");
+        let second = input([0, 11, 21, 31], "d");
+        let third = input([0, 12, 22, 32], "d");
+        let (one, read) = deltas(&first, &second);
+        assert_eq!(
+            (one.get("a"), one.get("b"), one.get("d"), read),
+            (None, Some(1), Some(1), 1)
+        );
+        let (two, read) = deltas(&second, &third);
+        assert_eq!(
+            (two.get("c"), read),
+            (Some(1), 0),
+            "the next keystroke shares them"
+        );
+        let mut pending = one.clone();
+        assert!(pending.add(two));
+        assert_eq!((pending.get("b"), pending.get("a")), (Some(2), None));
+        // a changed block reads them again
+        let renamed = input([0, 13, 23, 33], "e");
+        let (three, read) = deltas(&third, &renamed);
+        assert_eq!((three.get("e"), three.get("d"), read), (None, None, 1));
+        // blocks moved unlike are listed one by one
+        let unlike = input([0, 11, 23, 33], "d");
+        let (four, read) = deltas(&first, &unlike);
+        assert_eq!((four.get("b"), four.get("c"), read), (Some(1), Some(3), 0));
+        assert!(pending.add(four));
+        assert_eq!((pending.get("b"), pending.get("c")), (Some(3), Some(5)));
     }
 
     #[test]

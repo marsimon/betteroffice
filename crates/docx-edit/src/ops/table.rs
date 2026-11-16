@@ -1831,7 +1831,10 @@ impl EditingDoc {
         let txn = self.yrs_doc().transact();
         let story = story_ref(&txn, story_id).map_err(OpError::from)?;
         let embeds = self.table_embeds(story_id, &story, &txn);
-        match embeds.iter().position(|(offset, _)| *offset == target_index) {
+        match embeds
+            .iter()
+            .position(|(offset, _)| *offset == target_index)
+        {
             Some(ordinal) => Ok(TableLocator::new(story_id, ordinal as u32)),
             None => Err(OpError::UnknownTable {
                 story: story_id.to_owned(),
