@@ -4439,8 +4439,9 @@ fn resident_float_kinds(
     measurement: &docx_layout::measure_blocks::MeasurementConfig,
     geometry: &docx_layout::measure_blocks::FloatPageGeometry,
     memo: &RefCell<FloatKindsMemo>,
-) -> Result<(bool, bool), String> {
+) -> Result<(bool, bool, Vec<bool>), String> {
     let mut kinds = (false, false);
+    let mut zones = Vec::with_capacity(blocks.len());
     let default_width = widths.first().copied().unwrap_or(0.0);
     let config = crate::fingerprint::fingerprint_without_positions(&(
         default_width,
@@ -4489,10 +4490,11 @@ fn resident_float_kinds(
         };
         kinds.0 |= next.0;
         kinds.1 |= next.1;
+        zones.push(next.0);
     }
     memo.config = Some(config);
     memo.tables = tables;
-    Ok(kinds)
+    Ok((kinds.0, kinds.1, zones))
 }
 
 #[cfg(test)]
@@ -8288,7 +8290,7 @@ impl EngineSession {
                         measured_table_wrap_frames.clone_from(&table_wrap_frames);
                         measured_float_geometry = Some(float_geometry_key(&geometry));
                         float_width_policy = FloatWidthPolicy::for_document(blocks.iter());
-                        let (floats, margin_floats) = resident_float_kinds(
+                        let (floats, margin_floats, zone_blocks) = resident_float_kinds(
                             blocks,
                             &widths,
                             float_width_policy,
@@ -8315,6 +8317,7 @@ impl EngineSession {
                             &measurement,
                             measurement_fingerprint,
                             floats.then_some(&geometry),
+                            Some(&zone_blocks),
                             trigger,
                         )? {
                             Some((measured, fingerprints)) => {
@@ -11018,6 +11021,7 @@ impl EngineSession {
         measurement: &docx_layout::measure_blocks::MeasurementConfig,
         measurement_fingerprint: u64,
         floats: Option<&docx_layout::measure_blocks::FloatPageGeometry>,
+        zone_blocks: Option<&[bool]>,
         trigger: RelayoutTrigger,
     ) -> Result<Option<(Vec<MeasuredBlock>, Vec<Fingerprint>)>, String> {
         if !trigger.uses_region_path() {
@@ -11031,6 +11035,7 @@ impl EngineSession {
                 measurement,
                 measurement_fingerprint,
                 floats,
+                zone_blocks,
             );
         }
         let measurement_patch = self.measurement_patch().take();
@@ -11301,7 +11306,51 @@ impl EngineSession {
                         )
                     })
                     .unwrap_or(blocks.len());
-                if float_dirty[start..end].contains(&true) {
+                // A segment that anchors no float measures each block as a body
+                // without floats does, so only its dirty paragraphs are measured
+                // again, and the rest keep their extents.
+                let anchors_none = || {
+                    zone_blocks.is_some_and(|zones| {
+                        zones.len() == blocks.len() && !zones[start..end].contains(&true)
+                    }) && (start..end).all(|index| {
+                        let block = blocks.get(index).expect("body block");
+                        !anchors_objects(std::slice::from_ref(block))
+                            && (!float_dirty[index] || matches!(block, LayoutBlock::Paragraph(_)))
+                    })
+                };
+                if float_dirty[start..end].contains(&true) && anchors_none() {
+                    for index in (start..end).filter(|&index| float_dirty[index]) {
+                        let measurement_block = fingerprint_blocks[index]
+                            .as_mut()
+                            .expect("unsuppressed dirty block");
+                        let (measure, reads) = FontChainDependencies::capture(|| {
+                            if marks[index] {
+                                Ok(BlockExtent::Paragraph(ParagraphExtent {
+                                    lines: Vec::new(),
+                                    total_height: 0.0,
+                                }))
+                            } else {
+                                docx_layout::measure_blocks::measure_block(
+                                    measurement_block,
+                                    widths.get(index).copied().unwrap_or(default_width),
+                                    measurement,
+                                )
+                            }
+                        });
+                        dependencies[index] = reads;
+                        let entry = candidates[index].as_mut().expect("dirty block");
+                        retain_shape_measurements(&mut entry.block, measurement_block);
+                        entry.measure = measure?;
+                        measure_calls = measure_calls.wrapping_add(1);
+                        #[cfg(test)]
+                        {
+                            if measurement_patch.is_some() {
+                                CERTIFIED_FLOAT_WORK.with(|work| work.borrow_mut().1.push(index));
+                            }
+                            BODY_MEASUREMENT_WORK.with(|work| work.borrow_mut().0.push(index));
+                        }
+                    }
+                } else if float_dirty[start..end].contains(&true) {
                     let mut segment: Vec<_> = (start..end)
                         .map(|index| {
                             #[cfg(test)]
@@ -11460,6 +11509,7 @@ impl EngineSession {
         measurement: &docx_layout::measure_blocks::MeasurementConfig,
         measurement_fingerprint: u64,
         floats: Option<&docx_layout::measure_blocks::FloatPageGeometry>,
+        zone_blocks: Option<&[bool]>,
     ) -> Result<Option<(Vec<MeasuredBlock>, Vec<Fingerprint>)>, String> {
         let edited = self.pagination.borrow().doc_epoch != self.doc_epoch();
         if floats.is_some() && (self.measurement_patch().is_some() || !edited) {
@@ -11479,6 +11529,7 @@ impl EngineSession {
                 measurement,
                 measurement_fingerprint,
                 floats,
+                zone_blocks,
                 RelayoutTrigger::Bulk,
             );
         }
@@ -18893,6 +18944,7 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
                 &prepared.measurement,
                 prepared.measurement_fingerprint,
                 None,
+                None,
                 RelayoutTrigger::Preview,
             )
             .unwrap()
@@ -18920,6 +18972,7 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
                     &prepared.regions,
                     &prepared.measurement,
                     prepared.measurement_fingerprint,
+                    None,
                     None,
                     RelayoutTrigger::Preview,
                 )
@@ -19216,6 +19269,7 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
                     &prepared.regions,
                     &prepared.measurement,
                     prepared.measurement_fingerprint,
+                    None,
                     None,
                     RelayoutTrigger::Preview,
                 )
@@ -21149,6 +21203,8 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
         certified_float_segment(engine, replaced)
     }
 
+    /// The blocks a float-aware edit of `replaced` measures again: the float
+    /// segment holding it, or only `replaced` when that segment anchors no float.
     fn certified_float_segment(
         engine: &EngineSession,
         replaced: std::ops::Range<usize>,
@@ -21166,7 +21222,13 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
                 docx_layout::measure_blocks::resets_float_flow(blocks.get(index).unwrap())
             })
             .unwrap_or(blocks.len());
-        (start..end).collect()
+        if (start..end)
+            .any(|index| anchors_objects(std::slice::from_ref(blocks.get(index).unwrap())))
+        {
+            (start..end).collect()
+        } else {
+            replaced.collect()
+        }
     }
 
     #[test]
@@ -21603,7 +21665,7 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
         let policy = FloatWidthPolicy::for_document(blocks.iter());
         let kinds = |blocks: &SharedBlocks| {
             let before = FLOAT_TABLE_CLASSIFICATIONS.with(Cell::get);
-            let kinds = resident_float_kinds(
+            let (floats, margin, _) = resident_float_kinds(
                 blocks,
                 &widths,
                 policy,
@@ -21612,7 +21674,10 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
                 &engine.float_kinds,
             )
             .unwrap();
-            (kinds, FLOAT_TABLE_CLASSIFICATIONS.with(Cell::get) - before)
+            (
+                (floats, margin),
+                FLOAT_TABLE_CLASSIFICATIONS.with(Cell::get) - before,
+            )
         };
         assert_eq!(kinds(&blocks), ((true, false), 4));
         assert_eq!(kinds(&blocks), ((true, false), 0));
@@ -21633,6 +21698,55 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
             ((true, false), 1),
             "only the kinds in use are kept"
         );
+    }
+
+    #[test]
+    fn typing_in_a_float_free_segment_measures_only_its_paragraph() {
+        let fonts = docx_layout::MeasureFonts::default();
+        let _scope = fonts.enter();
+        let font = docx_layout::register_measure_font_bytes(lowering_pages::FONT).unwrap();
+        let shape = INSIDE_SHAPE
+            .replace("relativeFrom=\"margin\"", "relativeFrom=\"column\"")
+            .replace("<wp:align>inside</wp:align>", "<wp:align>left</wp:align>");
+        let section = r#"<w:sectPr><w:type w:val="nextPage"/><w:pgSz w:w="7200" w:h="8640"/><w:pgMar w:top="300" w:right="300" w:bottom="300" w:left="300"/></w:sectPr>"#;
+        let long = "Long text that wraps across several lines of its page. ".repeat(4);
+        let mut body = String::new();
+        for index in 0..24_u32 {
+            let mut content = String::new();
+            if index == 8 {
+                content.push_str("<w:pPr><w:pageBreakBefore/></w:pPr>");
+            }
+            content.push_str(&preview_fixture::run(&format!("{index} {long}")));
+            if index == 3 {
+                content.push_str(&shape);
+            }
+            body.push_str(&preview_fixture::paragraph(index + 1, &content));
+        }
+        body.push_str(section);
+        let bytes = preview_fixture::document(&body);
+        for trigger in [RelayoutTrigger::Bulk, RelayoutTrigger::Interactive] {
+            let engine = EngineSession::new(9639);
+            crate::seed_from_docx(engine.doc(), &bytes).unwrap();
+            engine.set_local_lowering(true);
+            let request = lowering_pages::region_request(&engine, &bytes, font).to_string();
+            engine.relayout_trigger.set(trigger);
+            engine
+                .layout_regions_for_trigger(&request, None, trigger)
+                .unwrap();
+            assert!(engine.pagination.borrow().measured_with_floats);
+            let mut retained = HashMap::new();
+            assert_certified_float_cold(&engine, &request, &mut retained);
+            for (paragraph, text) in [(12, "x"), (12, " wider words"), (5, "y")] {
+                engine.relayout_trigger.set(trigger);
+                measurement_patch_type(&engine, certified_float_offset(&engine, paragraph), text);
+                let expected = certified_float_dirty_segment(&engine);
+                // the floats' own segment is measured whole
+                assert_eq!(expected.len() == 1, paragraph == 12, "{paragraph}");
+                let (measured, full) = certified_float_layout(&engine, &request, trigger);
+                assert_eq!((measured, full), (expected, 0));
+                assert_certified_float_cold(&engine, &request, &mut retained);
+            }
+        }
     }
 
     #[test]
