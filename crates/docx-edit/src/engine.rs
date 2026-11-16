@@ -396,6 +396,8 @@ thread_local! {
     static TABLE_PATCHES: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
     /// Body paragraph patches that numbered the note references again.
     static BODY_NOTE_RENUMBERS: Cell<u64> = const { Cell::new(0) };
+    /// Arena blocks the plain region pass read note references from.
+    static NOTE_REF_SCANS: Cell<u64> = const { Cell::new(0) };
     static SHIFT_SAFETY_WORK: Cell<usize> = const { Cell::new(0) };
     static CERTIFIED_FLOAT_WORK: RefCell<(Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>)> = const { RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
     static OPEN_REGION_PATH_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
@@ -539,6 +541,7 @@ impl Drop for MovedArenaGuard<'_> {
             pagination.retain_matches.clear();
             pagination.moved_blocks.clear();
         }
+        pagination.walked_note_refs_absent = false;
     }
 }
 
@@ -2316,6 +2319,11 @@ struct PaginationState {
     input_lowering: Option<(u64, Rc<LoweringMap>)>,
     retain_matches: Vec<Option<BlockCertificate>>,
     moved_blocks: BTreeSet<usize>,
+    /// The plain region pass that retained `input` found no note reference in it.
+    input_note_refs_absent: bool,
+    /// The reuse walk moved the blocks of an `input` without note references and
+    /// measured no block holding one: the arena it built holds none.
+    walked_note_refs_absent: bool,
     #[cfg(test)]
     retain_match_calls: u64,
     /// The widths, table frames, float geometry and width policy used to measure the arena,
@@ -8725,11 +8733,22 @@ impl EngineSession {
         // one lands in another frame than it measured in, which typing rarely makes.
         // Settling and flow wrapping measure the blocks again but keep their runs,
         // so the note references read here are the final pass's.
-        let refs = input
-            .measured
-            .iter()
-            .flat_map(|measured| collect_note_refs(std::slice::from_ref(&measured.block)))
-            .collect::<Vec<_>>();
+        let walked_without_refs = {
+            let pagination = self.pagination.borrow();
+            pagination.walked_note_refs_absent && !pagination.moved_blocks.is_empty()
+        };
+        let refs = if walked_without_refs {
+            Vec::new()
+        } else {
+            #[cfg(test)]
+            NOTE_REF_SCANS.with(|scans| scans.set(scans.get() + input.measured.len() as u64));
+            input
+                .measured
+                .iter()
+                .flat_map(|measured| collect_note_refs(std::slice::from_ref(&measured.block)))
+                .collect::<Vec<_>>()
+        };
+        let note_refs_absent = refs.is_empty();
         let only_pictures =
             resident_body && refs.is_empty() && wraps_only_continuous_pictures(&input, &regions);
         let settle_pictures = (only_pictures && self.pictures_settled.get()).then(|| {
@@ -8745,8 +8764,14 @@ impl EngineSession {
                 &mut frames,
                 &pictures,
             );
-            // as the settling placement would leave the blocks
-            docx_layout::paragraph_spacing::apply_contextual_spacing_measured(&mut input.measured);
+            // as the settling placement would leave the blocks; placement applies
+            // it first thing, so only fingerprints taken from this arena below
+            // read the blocks before it
+            if block_fingerprints.is_none() {
+                docx_layout::paragraph_spacing::apply_contextual_spacing_measured(
+                    &mut input.measured,
+                );
+            }
             (spacing, frames)
         });
         if resident_body && settle_pictures.is_none() {
@@ -9105,6 +9130,8 @@ impl EngineSession {
         pagination.measured_float_width_policy =
             pagination.measured_with.map(|_| float_width_policy);
         pagination.measured_with_floats = has_floats;
+        pagination.input_note_refs_absent = note_refs_absent && pagination.input.is_some();
+        pagination.walked_note_refs_absent = false;
         // Checkpoints of a prefix pass describe a cut document.
         if provisional {
             pagination.checkpoints.clear();
@@ -10659,9 +10686,11 @@ impl EngineSession {
         } = run;
         let mut pagination = self.pagination.borrow_mut();
         pagination.input = Some(input);
+        pagination.input_note_refs_absent = false;
         pagination.flowed_tail = None;
         pagination.measured_spacing = measured_spacing;
         pagination.moved_blocks.clear();
+        pagination.walked_note_refs_absent = false;
         if trigger.uses_region_path() {
             pagination.retain_matches.clear();
         }
@@ -11460,6 +11489,7 @@ impl EngineSession {
         let mut measured = std::mem::take(&mut previous.measured);
         let mut retained = Vec::with_capacity(measured.len());
         let mut moved_blocks = Vec::new();
+        let mut note_refs_absent = pagination.input_note_refs_absent;
         for (index, candidate) in candidates.into_iter().enumerate() {
             if shifted_reuse.get(index) != Some(&true)
                 && (!reused[index] || candidate.is_some())
@@ -11469,7 +11499,11 @@ impl EngineSession {
             }
             let entry = &mut measured[index];
             let mut old = match candidate {
-                Some(candidate) => std::mem::replace(entry, *candidate),
+                Some(candidate) => {
+                    note_refs_absent = note_refs_absent
+                        && collect_note_refs(std::slice::from_ref(&candidate.block)).is_empty();
+                    std::mem::replace(entry, *candidate)
+                }
                 None => {
                     debug_assert!(reused[index], "an unfilled slot is reused");
                     moved_blocks.push(index);
@@ -11495,6 +11529,7 @@ impl EngineSession {
             retained.push(old);
         }
         previous.measured = retained;
+        pagination.walked_note_refs_absent = note_refs_absent && !moved_blocks.is_empty();
         // in index order, so an empty set is built in bulk
         if pagination.moved_blocks.is_empty() {
             pagination.moved_blocks = moved_blocks.into_iter().collect();
@@ -21777,6 +21812,89 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
                 assert_eq!((measured, full), (expected, 0));
                 assert_certified_float_cold(&engine, &request, &mut retained);
             }
+        }
+    }
+
+    #[test]
+    fn typing_without_note_references_skips_their_scan() {
+        let fonts = docx_layout::MeasureFonts::default();
+        let _scope = fonts.enter();
+        let font = docx_layout::register_measure_font_bytes(lowering_pages::FONT).unwrap();
+        let trigger = RelayoutTrigger::Interactive;
+        let (engine, request) = certified_float_engine(font, 40, &[0, 2, 4], false, false, trigger);
+        let mut retained = HashMap::new();
+        let mut scans = Vec::new();
+        for text in ["x", "y", "z"] {
+            engine.relayout_trigger.set(trigger);
+            measurement_patch_type(&engine, certified_float_offset(&engine, 20), text);
+            let before = NOTE_REF_SCANS.with(Cell::get);
+            certified_float_layout(&engine, &request, trigger);
+            scans.push(NOTE_REF_SCANS.with(Cell::get) - before);
+            assert_certified_float_cold(&engine, &request, &mut retained);
+        }
+        // the opening plain pass found no reference, and no keystroke adds one
+        assert_eq!(scans, [0, 0, 0]);
+
+        // A reference in the arena keeps every pass scanning.
+        let shape = INSIDE_SHAPE
+            .replace("relativeFrom=\"margin\"", "relativeFrom=\"column\"")
+            .replace("<wp:align>inside</wp:align>", "<wp:align>left</wp:align>");
+        let mut body = String::new();
+        for index in 0..24_u32 {
+            let mut content = preview_fixture::run(&format!("Text {index}."));
+            if index == 3 {
+                content.push_str(&shape);
+            }
+            if index == 12 {
+                content.push_str(r#"<w:r><w:footnoteReference w:id="2"/></w:r>"#);
+            }
+            body.push_str(&preview_fixture::paragraph(index + 1, &content));
+        }
+        body.push_str(r#"<w:sectPr><w:pgSz w:w="7200" w:h="8640"/><w:pgMar w:top="300" w:right="300" w:bottom="300" w:left="300"/></w:sectPr>"#);
+        let main = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
+        let parts: Vec<(String, Vec<u8>)> = [
+            ("[Content_Types].xml", r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/></Types>"#.to_owned()),
+            ("_rels/.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="doc" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#.to_owned()),
+            ("word/_rels/document.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="notes" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/></Relationships>"#.to_owned()),
+            ("word/footnotes.xml", format!(r#"<w:footnotes {main}><w:footnote w:id="2"><w:p><w:r><w:t>Note</w:t></w:r></w:p></w:footnote></w:footnotes>"#)),
+            ("word/document.xml", format!(r#"<w:document {main} xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><w:body>{body}</w:body></w:document>"#)),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value.into_bytes()))
+        .collect();
+        let bytes = ooxml_opc::rezip_parts(&parts).unwrap();
+        let engine = EngineSession::new(9693);
+        crate::seed_from_docx(engine.doc(), &bytes).unwrap();
+        engine.set_local_lowering(true);
+        let request = lowering_pages::region_request(&engine, &bytes, font).to_string();
+        engine.relayout_trigger.set(trigger);
+        engine
+            .layout_regions_for_trigger(&request, None, trigger)
+            .unwrap();
+        assert!(engine.pagination.borrow().measured_with_floats);
+        let mut retained = HashMap::new();
+        let blocks = engine
+            .pagination
+            .borrow()
+            .input
+            .as_ref()
+            .unwrap()
+            .measured
+            .len() as u64;
+        for text in ["x", "y"] {
+            engine.relayout_trigger.set(trigger);
+            measurement_patch_type(&engine, certified_float_offset(&engine, 18), text);
+            assert!(engine.measurement_patch().is_some());
+            let before = NOTE_REF_SCANS.with(Cell::get);
+            certified_float_layout(&engine, &request, trigger);
+            assert_eq!(NOTE_REF_SCANS.with(Cell::get) - before, blocks);
+            let env = engine.render.borrow().stories["body"].env.clone();
+            assert_eq!(resident_footnote_marks(&engine), vec![(2, "1".to_owned())]);
+            assert_eq!(
+                resident_footnote_marks(&engine),
+                fresh_footnote_marks(&engine, &env)
+            );
+            assert_certified_float_cold(&engine, &request, &mut retained);
         }
     }
 
