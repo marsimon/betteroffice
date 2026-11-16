@@ -234,7 +234,13 @@ pub(super) fn normalization_contexts(
 
 /// Only identity and start position survive until pagination consumes the old arena.
 pub(super) fn take_block(block: &mut LayoutBlock) -> LayoutBlock {
-    let metadata = super::fragment_identity(block).map_or(LayoutBlock::Unsupported, |id| {
+    let metadata = block_identity(block);
+    std::mem::replace(block, metadata)
+}
+
+/// What the old arena keeps of a moved block: its identity and start position.
+pub(super) fn block_identity(block: &LayoutBlock) -> LayoutBlock {
+    super::fragment_identity(block).map_or(LayoutBlock::Unsupported, |id| {
         LayoutBlock::Paragraph(ParagraphBlock {
             sdt_groups: None,
             id: id.clone(),
@@ -244,8 +250,7 @@ pub(super) fn take_block(block: &mut LayoutBlock) -> LayoutBlock {
             pm_start: block.pm_start(),
             pm_end: None,
         })
-    });
-    std::mem::replace(block, metadata)
+    })
 }
 
 #[cfg(test)]

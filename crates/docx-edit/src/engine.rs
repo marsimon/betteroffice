@@ -46,7 +46,9 @@ use yrs::{StickyIndex, Transact};
 
 mod retain;
 
-use retain::{BlockCertificate, BlockSource, SharedBlocks, normalization_contexts, take_block};
+use retain::{
+    BlockCertificate, BlockSource, SharedBlocks, block_identity, normalization_contexts, take_block,
+};
 
 use crate::EditingDoc;
 use crate::bridge::{BridgeError, LoweringMap, RenderEnv, RevisionPreview};
@@ -11451,7 +11453,12 @@ impl EngineSession {
                 }
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let mut measured = Vec::with_capacity(blocks.len());
+        // The new arena takes over the old one's storage, so a moved block is
+        // shifted where it lies. The old arena keeps what pagination reads of a
+        // moved block, its identity and start position, and the rest of the
+        // blocks it held.
+        let mut measured = std::mem::take(&mut previous.measured);
+        let mut retained = Vec::with_capacity(measured.len());
         let mut moved_blocks = Vec::new();
         for (index, candidate) in candidates.into_iter().enumerate() {
             if shifted_reuse.get(index) != Some(&true)
@@ -11460,31 +11467,34 @@ impl EngineSession {
             {
                 *safe = None;
             }
-            let previous_entry = &mut previous.measured[index];
-            let mut entry = match candidate {
-                Some(entry) => *entry,
+            let entry = &mut measured[index];
+            let mut old = match candidate {
+                Some(candidate) => std::mem::replace(entry, *candidate),
                 None => {
+                    debug_assert!(reused[index], "an unfilled slot is reused");
                     moved_blocks.push(index);
+                    // read before the shift: pagination takes the move from it
+                    let identity = block_identity(&entry.block);
+                    if shifted_reuse.get(index) == Some(&true)
+                        && let Some(patch) = &measurement_patch
+                        && index >= patch.replaced.end
+                        && patch.shift.delta != 0
+                    {
+                        crate::bridge::local::shift_block(&mut entry.block, patch.shift.delta);
+                    }
                     MeasuredBlock {
-                        block: take_block(&mut previous_entry.block),
-                        measure: BlockExtent::Unsupported,
+                        block: identity,
+                        measure: std::mem::replace(&mut entry.measure, BlockExtent::Unsupported),
                     }
                 }
             };
             if reused[index] {
-                if shifted_reuse.get(index) == Some(&true)
-                    && let Some(patch) = &measurement_patch
-                    && index >= patch.replaced.end
-                    && patch.shift.delta != 0
-                {
-                    crate::bridge::local::shift_block(&mut entry.block, patch.shift.delta);
-                }
                 pagination.measurement_patch = None;
-                entry.measure =
-                    std::mem::replace(&mut previous_entry.measure, BlockExtent::Unsupported);
+                entry.measure = std::mem::replace(&mut old.measure, BlockExtent::Unsupported);
             }
-            measured.push(entry);
+            retained.push(old);
         }
+        previous.measured = retained;
         // in index order, so an empty set is built in bulk
         if pagination.moved_blocks.is_empty() {
             pagination.moved_blocks = moved_blocks.into_iter().collect();
