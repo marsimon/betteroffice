@@ -1,6 +1,6 @@
 {
   "name": "@betteroffice/fonts",
-  "version": "0.4.2",
+  "version": "0.4.2-fork.1",
   "description": "Bundled open fonts for the BetterOffice engine: metric-compatible Latin faces (Carlito, Caladea, Liberation, Gelasio, Comic Relief), common presentation families (Inter, Roboto, Montserrat and more) plus Noto RTL script-coverage faces, with a lazy same-origin loader. Optional coverage faces ship separately in @betteroffice/fonts-cjk and @betteroffice/fonts-intl.",
   "sideEffects": false,
   "type": "module",
@@ -40,7 +40,7 @@
     "export:catalog": "bun scripts/export-catalog.ts"
   },
   "peerDependencies": {
-    "@betteroffice/fonts-cjk": "workspace:^0",
+    "@betteroffice/fonts-cjk": "workspace:^",
     "@betteroffice/fonts-intl": "workspace:^0"
   },
   "peerDependenciesMeta": {

@@ -317,7 +317,7 @@
     },
     "packages/docx": {
       "name": "@betteroffice/docx",
-      "version": "0.5.1",
+      "version": "0.5.1-fork.1",
       "dependencies": {
         "@betteroffice/fonts": "workspace:^",
       },
@@ -330,7 +330,7 @@
     },
     "packages/docx-i18n": {
       "name": "@betteroffice/docx-i18n",
-      "version": "0.5.1",
+      "version": "0.5.1-fork.1",
       "devDependencies": {
         "tsup": "^8.0.1",
         "typescript": "^6.0.3",
@@ -338,7 +338,7 @@
     },
     "packages/docx-react": {
       "name": "@betteroffice/docx-react",
-      "version": "0.5.1",
+      "version": "0.5.1-fork.1",
       "dependencies": {
         "@betteroffice/docx": "workspace:*",
         "@betteroffice/docx-i18n": "workspace:*",
@@ -373,7 +373,7 @@
     },
     "packages/fonts": {
       "name": "@betteroffice/fonts",
-      "version": "0.4.2",
+      "version": "0.4.2-fork.1",
       "dependencies": {
         "@betteroffice/fonts-latin": "workspace:*",
       },
@@ -387,7 +387,7 @@
         "typescript": "^6.0.3",
       },
       "peerDependencies": {
-        "@betteroffice/fonts-cjk": "workspace:^0",
+        "@betteroffice/fonts-cjk": "workspace:^",
         "@betteroffice/fonts-intl": "workspace:^0",
       },
       "optionalPeers": [
@@ -397,7 +397,7 @@
     },
     "packages/fonts-cjk": {
       "name": "@betteroffice/fonts-cjk",
-      "version": "0.4.2",
+      "version": "0.4.2-fork.1",
       "devDependencies": {
         "tsup": "^8.0.1",
         "typescript": "^6.0.3",
@@ -413,7 +413,7 @@
     },
     "packages/fonts-latin": {
       "name": "@betteroffice/fonts-latin",
-      "version": "0.4.2",
+      "version": "0.4.2-fork.1",
       "devDependencies": {
         "tsup": "^8.0.1",
         "typescript": "^6.0.3",
