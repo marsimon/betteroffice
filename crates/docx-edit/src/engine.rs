@@ -398,6 +398,8 @@ thread_local! {
     static BODY_NOTE_RENUMBERS: Cell<u64> = const { Cell::new(0) };
     /// Arena blocks the plain region pass read note references from.
     static NOTE_REF_SCANS: Cell<u64> = const { Cell::new(0) };
+    /// Blocks the resident walk captured spacing for anew.
+    static SPACING_CAPTURES: Cell<u64> = const { Cell::new(0) };
     static SHIFT_SAFETY_WORK: Cell<usize> = const { Cell::new(0) };
     static CERTIFIED_FLOAT_WORK: RefCell<(Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>)> = const { RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
     static OPEN_REGION_PATH_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
@@ -2243,6 +2245,14 @@ fn extend_input_for_header_footer(
     }
 }
 
+/// A reused arena, its fingerprints and, when the walk kept them, its spacing
+/// captures.
+type ResidentRegionArena = (
+    Vec<MeasuredBlock>,
+    Vec<Fingerprint>,
+    Option<Vec<BlockSpacing>>,
+);
+
 #[derive(Debug)]
 struct MeasurementPatch {
     base_generation: u64,
@@ -3519,11 +3529,12 @@ fn contextual_spacing_enabled(paragraph: &docx_layout::types::ParagraphBlock) ->
         .is_some_and(|attrs| attrs.contextual_spacing.unwrap_or(false))
 }
 
-#[derive(Clone, Debug)]
+/// Shared, so the reuse walk keeps a moved table's capture by reference.
+#[derive(Clone, Debug, PartialEq)]
 enum BlockSpacing {
     None,
     Paragraph(Option<u64>, Option<u64>),
-    Table(Vec<Self>),
+    Table(Rc<[Self]>),
 }
 
 impl BlockSpacing {
@@ -3586,7 +3597,7 @@ impl BlockSpacing {
                 if entries.iter().all(|entry| matches!(entry, Self::None)) {
                     Self::None
                 } else {
-                    Self::Table(entries)
+                    Self::Table(entries.into())
                 }
             }
             _ => Self::None,
@@ -8295,8 +8306,7 @@ impl EngineSession {
                     &mut || {},
                     |blocks, lowering| -> Result<Arena, String> {
                         input_lowering = Some(lowering);
-                        measured_spacing =
-                            BlockSpacing::capture_blocks(blocks.iter(), Some(&regions));
+                        let capture = || BlockSpacing::capture_blocks(blocks.iter(), Some(&regions));
                         apply_section_geometry(&mut input, &regions);
                         let (widths, mut table_wrap_frames) =
                             region_table_measurement_frames(blocks.iter(), &input, &regions);
@@ -8323,6 +8333,7 @@ impl EngineSession {
                         has_floats = floats;
                         // margin-relative zones couple the whole flow; re-measure all
                         if margin_floats || (floats && blocks.iter().any(|block| matches!(block, LayoutBlock::Shape(shape) if wraps_by_page_side(shape)))) {
+                            measured_spacing = capture();
                             return Ok(Arena::Full(blocks.to_vec(), true));
                         }
                         match self.resident_region_measured(
@@ -8342,10 +8353,16 @@ impl EngineSession {
                             Some(&zone_blocks),
                             trigger,
                         )? {
-                            Some((measured, fingerprints)) => {
+                            Some((measured, fingerprints, spacing)) => {
+                                measured_spacing = spacing.unwrap_or_else(capture);
+                                #[cfg(test)]
+                                assert_eq!(measured_spacing, capture(), "reused spacing");
                                 Ok(Arena::Reused(measured, fingerprints))
                             }
-                            None => Ok(Arena::Full(blocks.to_vec(), false)),
+                            None => {
+                                measured_spacing = capture();
+                                Ok(Arena::Full(blocks.to_vec(), false))
+                            }
                         }
                     },
                 )
@@ -11066,7 +11083,7 @@ impl EngineSession {
         floats: Option<&docx_layout::measure_blocks::FloatPageGeometry>,
         zone_blocks: Option<&[bool]>,
         trigger: RelayoutTrigger,
-    ) -> Result<Option<(Vec<MeasuredBlock>, Vec<Fingerprint>)>, String> {
+    ) -> Result<Option<ResidentRegionArena>, String> {
         if !trigger.uses_region_path() {
             return self.resident_region_measured_plain(
                 blocks,
@@ -11199,23 +11216,27 @@ impl EngineSession {
                         _ => lowered.get(index) == Some(next_block),
                     }
                 });
+            // The patch certifies a block as the last pass's shifted, under the
+            // same request, so its spacing still matches its capture.
+            let certified = measurement_patch
+                .as_ref()
+                .is_some_and(|patch| patch.certifies_block(blocks, index));
             let width_clean = self.font_dependency_matches(
                 &dependencies[index],
                 &measurement.font_chains,
                 font_chains_unchanged,
             ) && section_break_mark == retained_section_break_mark
-                && pagination.measured_spacing[index].matches(
-                    next_block,
-                    Some(regions.paragraph_spacing_line_px(section_index)),
-                )
+                && (certified
+                    || pagination.measured_spacing[index].matches(
+                        next_block,
+                        Some(regions.paragraph_spacing_line_px(section_index)),
+                    ))
                 && widths.get(index) == previous_widths.get(index)
                 && matches!(previous_entry.measure, BlockExtent::Unsupported)
                     == matches!(next_block, LayoutBlock::Unsupported)
                 && raw_clean;
             let certified_shift = width_clean
-                && measurement_patch
-                    .as_ref()
-                    .is_some_and(|patch| patch.certifies_block(blocks, index))
+                && certified
                 && *pagination.measured_shift_safe[index]
                     .get_or_insert_with(|| measurement_shift_safe(&previous_entry.block));
             if certified_shift {
@@ -11489,6 +11510,9 @@ impl EngineSession {
         let mut measured = std::mem::take(&mut previous.measured);
         let mut retained = Vec::with_capacity(measured.len());
         let mut moved_blocks = Vec::new();
+        // A moved block keeps its spacing capture, which matched it above. The
+        // retained captures stay for the flowed tail the pass may restore.
+        let mut spacing = pagination.measured_spacing.clone();
         let mut note_refs_absent = pagination.input_note_refs_absent;
         for (index, candidate) in candidates.into_iter().enumerate() {
             if shifted_reuse.get(index) != Some(&true)
@@ -11502,6 +11526,12 @@ impl EngineSession {
                 Some(candidate) => {
                     note_refs_absent = note_refs_absent
                         && collect_note_refs(std::slice::from_ref(&candidate.block)).is_empty();
+                    spacing[index] = BlockSpacing::capture(
+                        blocks.get(index).expect("body block"),
+                        Some(regions.paragraph_spacing_line_px(sections[index])),
+                    );
+                    #[cfg(test)]
+                    SPACING_CAPTURES.with(|captures| captures.set(captures.get() + 1));
                     std::mem::replace(entry, *candidate)
                 }
                 None => {
@@ -11560,7 +11590,7 @@ impl EngineSession {
         if measurement_patch.is_some() {
             self.certified_measurement_epoch.set(Some(self.doc_epoch()));
         }
-        Ok(Some((measured, block_fingerprints)))
+        Ok(Some((measured, block_fingerprints, Some(spacing))))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11576,7 +11606,7 @@ impl EngineSession {
         measurement_fingerprint: u64,
         floats: Option<&docx_layout::measure_blocks::FloatPageGeometry>,
         zone_blocks: Option<&[bool]>,
-    ) -> Result<Option<(Vec<MeasuredBlock>, Vec<Fingerprint>)>, String> {
+    ) -> Result<Option<ResidentRegionArena>, String> {
         let edited = self.pagination.borrow().doc_epoch != self.doc_epoch();
         if floats.is_some() && (self.measurement_patch().is_some() || !edited) {
             #[cfg(test)]
@@ -11956,7 +11986,7 @@ impl EngineSession {
         measurement_state.resident_reused_blocks = measurement_state
             .resident_reused_blocks
             .wrapping_add(reused_blocks);
-        Ok(Some((measured, block_fingerprints)))
+        Ok(Some((measured, block_fingerprints, None)))
     }
 
     /// Complete the post-edit dependency cone and return its binary frame.
@@ -18999,7 +19029,7 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
             pagination.measured_widths = vec![300.0];
             pagination.set_font_dependencies(vec![dependencies.clone()], None);
         }
-        let (reused, fingerprints) = engine
+        let (reused, fingerprints, spacing) = engine
             .resident_region_measured(
                 &blocks,
                 None,
@@ -19019,6 +19049,7 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
             let mut pagination = engine.pagination.borrow_mut();
             pagination.input.as_mut().unwrap().measured = reused;
             pagination.block_fingerprints = fingerprints;
+            pagination.measured_spacing = spacing.unwrap();
         }
         let font = include_bytes!("../../ooxml-text/tests/fonts/LiberationSans-Regular.ttf");
         assert_eq!(docx_layout::register_measure_font_bytes(font).unwrap(), 0);
@@ -19325,7 +19356,7 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
                 "kind": if previous_is_section {"pageBreak"} else {"sectionBreak"}, "id": "previous"
             }))
             .unwrap();
-            let (warm, _) = engine
+            let (warm, _, _) = engine
                 .resident_region_measured(
                     &blocks,
                     None,
@@ -21813,6 +21844,114 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
                 assert_certified_float_cold(&engine, &request, &mut retained);
             }
         }
+    }
+
+    #[test]
+    fn typing_captures_spacing_only_for_the_blocks_measured_anew() {
+        let fonts = docx_layout::MeasureFonts::default();
+        let _scope = fonts.enter();
+        let font = docx_layout::register_measure_font_bytes(lowering_pages::FONT).unwrap();
+        for trigger in [RelayoutTrigger::Bulk, RelayoutTrigger::Interactive] {
+            let (engine, request) =
+                certified_float_engine(font, 40, &[0, 2, 4], false, false, trigger);
+            let blocks = engine.pagination.borrow().measured_spacing.len() as u64;
+            let mut retained = HashMap::new();
+            for (paragraph, text) in [(28, "x"), (28, " more words"), (20, "z")] {
+                engine.relayout_trigger.set(trigger);
+                measurement_patch_type(&engine, certified_float_offset(&engine, paragraph), text);
+                let before = SPACING_CAPTURES.with(Cell::get);
+                certified_float_layout(&engine, &request, trigger);
+                let captures = SPACING_CAPTURES.with(Cell::get) - before;
+                // the edited paragraph, and the blocks of its segment when floats shape it
+                assert!(
+                    captures > 0 && captures * 3 < blocks,
+                    "{captures} of {blocks}"
+                );
+                assert_eq!(
+                    engine.pagination.borrow().measured_spacing.len() as u64,
+                    blocks
+                );
+                assert_certified_float_cold(&engine, &request, &mut retained);
+            }
+        }
+    }
+
+    #[test]
+    fn the_reuse_walk_captures_spacing_anew_for_a_changed_block() {
+        let _preview = PreviewSwitch::new(Some(true));
+        let fonts = docx_layout::MeasureFonts::default();
+        let _scope = fonts.enter();
+        let engine = EngineSession::new(9694);
+        let paragraph = |id: &str, before: f64| {
+            json!({"kind": "paragraph", "id": id,
+                "runs": [{"kind": "text", "text": "Text", "fontFamily": "Requested"}],
+                "attrs": {"contextualSpacing": true, "spacing": {"before": before, "after": 4.0}}})
+        };
+        let mut blocks: Vec<LayoutBlock> = serde_json::from_value(json!([
+            paragraph("a", 6.0),
+            paragraph("b", 6.0),
+            paragraph("c", 6.0)
+        ]))
+        .unwrap();
+        let request = json!({
+            "measurement": {"defaults": {"fontFamily": "Requested", "fontSize": 12}}
+        });
+        let prepared = engine
+            .prepare_region_layout(&request.to_string(), None, RelayoutTrigger::Preview)
+            .unwrap();
+        let mut measured = Vec::new();
+        let mut dependencies = Vec::new();
+        for block in &blocks {
+            let mut block = block.clone();
+            let (measure, reads) = FontChainDependencies::capture(|| {
+                docx_layout::measure_blocks::measure_block(&mut block, 300.0, &prepared.measurement)
+                    .unwrap()
+            });
+            measured.push(MeasuredBlock { block, measure });
+            dependencies.push(reads);
+        }
+        let retained = BlockSpacing::capture_blocks(blocks.iter(), Some(&prepared.regions));
+        {
+            let mut pagination = engine.pagination.borrow_mut();
+            pagination.input = Some(LayoutInput {
+                measured,
+                options: Default::default(),
+            });
+            pagination.measured_spacing = retained.clone();
+            pagination.block_fingerprints =
+                measured_fingerprints(pagination.input.as_ref().unwrap()).unwrap();
+            pagination.measured_with = Some(prepared.measurement_fingerprint);
+            pagination.measured_float_width_policy =
+                Some(FloatWidthPolicy::for_document(blocks.iter()));
+            pagination.measured_widths = vec![300.0; 3];
+            pagination.set_font_dependencies(dependencies, None);
+        }
+        blocks[1] = serde_json::from_value(paragraph("b", 12.0)).unwrap();
+        let before = SPACING_CAPTURES.with(Cell::get);
+        let (_, _, spacing) = engine
+            .resident_region_measured(
+                &blocks,
+                None,
+                &[300.0; 3],
+                FloatWidthPolicy::for_document(blocks.iter()),
+                &[],
+                &prepared.regions,
+                &prepared.measurement,
+                prepared.measurement_fingerprint,
+                None,
+                None,
+                RelayoutTrigger::Preview,
+            )
+            .unwrap()
+            .unwrap();
+        let spacing = spacing.unwrap();
+        assert!(SPACING_CAPTURES.with(Cell::get) > before);
+        assert_eq!(
+            spacing,
+            BlockSpacing::capture_blocks(blocks.iter(), Some(&prepared.regions))
+        );
+        assert_ne!(spacing[1], retained[1]);
+        assert_eq!(spacing[0], retained[0]);
     }
 
     #[test]
