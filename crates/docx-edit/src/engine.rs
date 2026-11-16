@@ -392,6 +392,8 @@ thread_local! {
     static REGION_FULL_PASSES: Cell<usize> = const { Cell::new(0) };
     /// Table patches applied in place and by copy.
     static TABLE_PATCHES: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    /// Body paragraph patches that numbered the note references again.
+    static BODY_NOTE_RENUMBERS: Cell<u64> = const { Cell::new(0) };
     static SHIFT_SAFETY_WORK: Cell<usize> = const { Cell::new(0) };
     static CERTIFIED_FLOAT_WORK: RefCell<(Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>)> = const { RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
     static OPEN_REGION_PATH_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
@@ -6218,10 +6220,20 @@ impl EngineSession {
                 lowered
                     .local
                     .patch(blocks.shared_mut(), map, revealable, &txn, env, &edit)?;
-            let renumbered = docx_layout::footnotes::number_note_references(
-                blocks.shared_mut().as_mut_slice(),
-                &env.note_numbering,
-            );
+            // Without note references in the paragraph before or after the edit,
+            // and with its section end unchanged, numbering labels nothing anew.
+            let patched = blocks.shared().get(slot)?;
+            let notes = !collect_note_refs(std::slice::from_ref(old_block.as_ref())).is_empty()
+                || !collect_note_refs(std::slice::from_ref(patched.as_ref())).is_empty()
+                || advances_region_section(old_block.as_ref())
+                    != advances_region_section(patched.as_ref());
+            #[cfg(test)]
+            BODY_NOTE_RENUMBERS.with(|count| count.set(count.get() + u64::from(notes)));
+            let renumbered = notes
+                && docx_layout::footnotes::number_note_references(
+                    blocks.shared_mut().as_mut_slice(),
+                    &env.note_numbering,
+                );
             Some((shift, renumbered))
         })();
         let Some((shift, renumbered)) = shift else {
@@ -11094,8 +11106,10 @@ impl EngineSession {
         let font_chains_unchanged =
             pagination.measured_font_chains.as_ref() == Some(&measurement.font_chains);
         let mut dependencies = pagination.measured_font_dependencies.clone();
-        let mut candidates = Vec::with_capacity(blocks.len());
-        let mut fingerprint_blocks = vec![None; blocks.len()];
+        // A paragraph block is over a kilobyte, so the per-block slots hold boxes:
+        // most blocks of an edit are shifted in place and fill no slot.
+        let mut candidates: Vec<Option<Box<MeasuredBlock>>> = Vec::with_capacity(blocks.len());
+        let mut fingerprint_blocks: Vec<Option<Box<LayoutBlock>>> = vec![None; blocks.len()];
         let mut reused = vec![false; blocks.len()];
         let mut certificates = vec![None; blocks.len()];
         let mut float_dirty = vec![false; blocks.len()];
@@ -11217,10 +11231,10 @@ impl EngineSession {
                 reused[index] = true;
                 certificates[index] = certificate.cloned();
             } else if width_clean && measurement_patch.is_none() && *next_block == *previous_block {
-                candidates.push(Some(MeasuredBlock {
+                candidates.push(Some(Box::new(MeasuredBlock {
                     block: next_block.clone(),
                     measure: BlockExtent::Unsupported,
-                }));
+                })));
                 reused[index] = true;
             } else {
                 #[cfg(test)]
@@ -11228,7 +11242,7 @@ impl EngineSession {
                     CERTIFIED_FLOAT_WORK.with(|work| work.borrow_mut().1.push(index));
                 }
                 let mut owned = normalize_measurement_block(next_block, regions, section_index);
-                fingerprint_blocks[index] = Some(owned.clone());
+                fingerprint_blocks[index] = Some(Box::new(owned.clone()));
                 suppress_contextual_spacing(blocks, index, &mut owned);
                 docx_layout::paragraph_spacing::apply_contextual_spacing_blocks(
                     std::slice::from_mut(&mut owned),
@@ -11251,17 +11265,17 @@ impl EngineSession {
                     if shape_equal && measurement_patch.is_some() {
                         retain_shape_measurements(&mut owned, previous_block);
                     }
-                    candidates.push(Some(MeasuredBlock {
+                    candidates.push(Some(Box::new(MeasuredBlock {
                         block: owned,
                         measure: BlockExtent::Unsupported,
-                    }));
+                    })));
                     reused[index] = true;
                 } else if floats.is_some() {
                     float_dirty[index] = true;
-                    candidates.push(Some(MeasuredBlock {
+                    candidates.push(Some(Box::new(MeasuredBlock {
                         block: owned,
                         measure: BlockExtent::Unsupported,
-                    }));
+                    })));
                 } else {
                     let measurement_block = fingerprint_blocks[index]
                         .as_mut()
@@ -11282,10 +11296,10 @@ impl EngineSession {
                     });
                     dependencies[index] = reads;
                     retain_shape_measurements(&mut owned, measurement_block);
-                    candidates.push(Some(MeasuredBlock {
+                    candidates.push(Some(Box::new(MeasuredBlock {
                         block: owned,
                         measure: measure?,
-                    }));
+                    })));
                     measure_calls = measure_calls.wrapping_add(1);
                     #[cfg(test)]
                     BODY_MEASUREMENT_WORK.with(|work| work.borrow_mut().0.push(index));
@@ -11382,12 +11396,12 @@ impl EngineSession {
                         segment.into_iter().zip(extents).enumerate()
                     {
                         let index = start + offset;
-                        fingerprint_blocks[index] = Some(block.clone());
+                        fingerprint_blocks[index] = Some(Box::new(block.clone()));
                         suppress_contextual_spacing(blocks, index, &mut block);
                         docx_layout::paragraph_spacing::apply_contextual_spacing_blocks(
                             std::slice::from_mut(&mut block),
                         );
-                        candidates[index] = Some(MeasuredBlock { block, measure });
+                        candidates[index] = Some(Box::new(MeasuredBlock { block, measure }));
                         dependencies[index] = reads[offset].clone();
                         reused[index] = false;
                         if let Some(shifted) = shifted_reuse.get_mut(index) {
@@ -11418,7 +11432,7 @@ impl EngineSession {
                     let entry = entry.as_ref().expect("normalized retained block");
                     let mut block = fingerprint_blocks[index]
                         .take()
-                        .unwrap_or_else(|| entry.block.clone());
+                        .map_or_else(|| entry.block.clone(), |block| *block);
                     retain_shape_measurements(&mut block, &entry.block);
                     measured_parts_fingerprint(&block, &previous.measured[index].measure)
                 } else if reused[index] {
@@ -11429,7 +11443,7 @@ impl EngineSession {
                         CERTIFIED_FLOAT_WORK.with(|work| work.borrow_mut().3.push(index));
                     }
                     let entry = entry.as_ref().expect("measured dirty block");
-                    let mut block = fingerprint_blocks[index]
+                    let mut block = *fingerprint_blocks[index]
                         .take()
                         .expect("unsuppressed dirty block");
                     retain_shape_measurements(&mut block, &entry.block);
@@ -11438,6 +11452,7 @@ impl EngineSession {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let mut measured = Vec::with_capacity(blocks.len());
+        let mut moved_blocks = Vec::new();
         for (index, candidate) in candidates.into_iter().enumerate() {
             if shifted_reuse.get(index) != Some(&true)
                 && (!reused[index] || candidate.is_some())
@@ -11447,9 +11462,9 @@ impl EngineSession {
             }
             let previous_entry = &mut previous.measured[index];
             let mut entry = match candidate {
-                Some(entry) => entry,
+                Some(entry) => *entry,
                 None => {
-                    pagination.moved_blocks.insert(index);
+                    moved_blocks.push(index);
                     MeasuredBlock {
                         block: take_block(&mut previous_entry.block),
                         measure: BlockExtent::Unsupported,
@@ -11469,6 +11484,12 @@ impl EngineSession {
                     std::mem::replace(&mut previous_entry.measure, BlockExtent::Unsupported);
             }
             measured.push(entry);
+        }
+        // in index order, so an empty set is built in bulk
+        if pagination.moved_blocks.is_empty() {
+            pagination.moved_blocks = moved_blocks.into_iter().collect();
+        } else {
+            pagination.moved_blocks.extend(moved_blocks);
         }
         #[cfg(test)]
         {
@@ -23176,6 +23197,80 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
             partial.as_secs_f64() * 1e3 / f64::from(EDITS),
             renumber.as_secs_f64() * 1e6 / f64::from(EDITS),
         );
+    }
+
+    #[test]
+    fn typing_away_from_note_references_numbers_nothing_again() {
+        use super::lowering_fixture::{Package, para, run};
+
+        let fonts = docx_layout::MeasureFonts::default();
+        let _scope = fonts.enter();
+        let mut body = String::new();
+        let mut notes = format!("<w:footnotes {}>", lowering_fixture::NS);
+        for index in 0..6_usize {
+            let mut content = run(&format!("Paragraph {index}"));
+            if index % 3 == 1 {
+                let id = index / 3 + 1;
+                content.push_str(&format!(r#"<w:r><w:footnoteReference w:id="{id}"/></w:r>"#));
+                notes.push_str(&format!(
+                    r#"<w:footnote w:id="{id}"><w:p><w:r><w:t>Note {id}</w:t></w:r></w:p></w:footnote>"#
+                ));
+            }
+            body.push_str(&para(&format!("{:08X}", 0x10000001 + index), &content));
+        }
+        notes.push_str("</w:footnotes>");
+        let bytes = Package::new(&body)
+            .part(
+                "footnotes.xml",
+                "rIdNotes",
+                "footnotes",
+                "footnotes",
+                &notes,
+            )
+            .bytes();
+        let font = docx_layout::register_measure_font_bytes(lowering_pages::FONT).unwrap();
+        let engine = EngineSession::new(9692);
+        crate::seed_from_docx(engine.doc(), &bytes).unwrap();
+        engine.set_local_lowering(true);
+        let request = small_page_request(font);
+        engine
+            .layout_regions_for_trigger(&request, None, RelayoutTrigger::Bulk)
+            .unwrap();
+        let marks = vec![(1, "1".to_owned()), (2, "2".to_owned())];
+        assert_eq!(resident_footnote_marks(&engine), marks);
+        // A paragraph holding a reference is lowered whole, not patched.
+        for (paragraph, lowered) in [(2, 0), (1, 1), (3, 0), (5, 0), (4, 1), (2, 0)] {
+            let before = (
+                BODY_NOTE_RENUMBERS.with(Cell::get),
+                engine.stats().lower_cache_misses,
+            );
+            let offset = measurement_patch_offset(&engine, paragraph);
+            engine
+                .edit_resident_text(
+                    crate::StoryRange::new("body", offset, offset),
+                    Some("x"),
+                    true,
+                )
+                .unwrap();
+            engine
+                .layout_document_with_regions_after_edit(&request, Some("body"))
+                .unwrap();
+            assert_eq!(
+                (
+                    BODY_NOTE_RENUMBERS.with(Cell::get) - before.0,
+                    engine.stats().lower_cache_misses - before.1,
+                ),
+                (0, lowered),
+                "{paragraph}"
+            );
+            let env = engine.render.borrow().stories["body"].env.clone();
+            assert_eq!(resident_footnote_marks(&engine), marks, "{paragraph}");
+            assert_eq!(
+                resident_footnote_marks(&engine),
+                fresh_footnote_marks(&engine, &env)
+            );
+        }
+        assert_local_patch_matches_cold(&engine, &request, "typing around note references");
     }
 
     #[test]
