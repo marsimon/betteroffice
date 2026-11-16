@@ -284,6 +284,29 @@ test('a face opened with file URLs names every slice file and the fetch timeout 
   expect(sliceSourceOf(await openProgressiveFace(jpRef, transport([])))).toBeUndefined();
 });
 
+test('a bundler\'s page-relative file URLs reach another realm resolved against the page, and absolute ones stay as they are', async () => {
+  const index = JSON.parse(await Bun.file(new URL(jpRef.index, assets)).text()) as Index;
+  // webpack's `url: 'relative'` (Next) hands out URL-like objects whose `href` is a path on the page's origin.
+  const relative = (file: string) => {
+    const href = `/_next/static/media/${file}`;
+    return { href, toString: () => href } as unknown as URL;
+  };
+  const absolute = (file: string) => new URL(file, 'https://fonts.example/cjk/');
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'location');
+  Object.defineProperty(globalThis, 'location', { value: { href: 'https://app.example/documents/7?tab=1' }, configurable: true });
+  try {
+    const paged = await sliceSourceOf(await openProgressiveFace(jpRef, { ...transport([]), url: async (file) => relative(file) }))!;
+    const chunk = index.chunks[0]!.file;
+    expect(paged.urls[chunk]).toBe(`https://app.example/_next/static/media/${chunk}`);
+    expect(Object.values(paged.urls).every((url) => url.startsWith('https://app.example/_next/static/media/'))).toBe(true);
+    const kept = await sliceSourceOf(await openProgressiveFace(jpRef, { ...transport([]), url: async (file) => absolute(file) }))!;
+    expect(kept.urls[chunk]).toBe(absolute(chunk).href);
+  } finally {
+    if (previous) Object.defineProperty(globalThis, 'location', previous);
+    else delete (globalThis as { location?: unknown }).location;
+  }
+});
+
 test('a location without file URLs cannot open, so callers fall back to the whole face', async () => {
   const { slices } = createFontProvider({ baseUrl: assets }).resolveScriptFallback('cjk-jp', false, false)!;
   const { url: _url, ...withoutUrl } = slices!;

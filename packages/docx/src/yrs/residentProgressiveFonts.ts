@@ -135,7 +135,8 @@ export class ResidentProgressiveFonts {
           read: (file) => {
             const url = spec.source.urls[file];
             if (url === undefined) return Promise.reject(new Error(`Font slice ${file} has no URL`));
-            return readFontAsset(file, new URL(url), spec.source.timeoutMs);
+            // Sources are absolute; one a page-relative bundler URL slipped into resolves against this worker's location.
+            return readFontAsset(file, new URL(url, globalThis.location?.href), spec.source.timeoutMs);
           },
           decode,
         })).catch((error: unknown) => {

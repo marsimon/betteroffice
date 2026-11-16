@@ -104,6 +104,16 @@ export interface SliceSource {
 const opened = new WeakMap<ProgressiveFontFace, [SliceRef, SliceIndex, SliceTransport]>();
 const sources = new WeakMap<ProgressiveFontFace, Promise<SliceSource>>();
 
+/**
+ * The absolute address of `url`. A bundler may hand out asset URLs whose `href` is relative to the page
+ * (webpack's `url: 'relative'`, which Next uses), and another realm cannot fetch those, so they resolve
+ * against this realm's location as asset bases do.
+ */
+function absoluteHref(url: URL): string {
+  const href = String(url.href);
+  return typeof location === 'undefined' ? new URL(href).href : new URL(href, location.href).href;
+}
+
 /** @internal The files of a face `openProgressiveFace` opened with a transport that names URLs. */
 export function sliceSourceOf(face: ProgressiveFontFace): Promise<SliceSource> | undefined {
   const entry = opened.get(face);
@@ -114,7 +124,7 @@ export function sliceSourceOf(face: ProgressiveFontFace): Promise<SliceSource> |
   if (source === undefined) {
     source = (async () => {
       const urls: Record<string, string> = {};
-      for (const { file } of [{ file: ref.index }, index.skeleton, index.core, ...index.chunks]) urls[file] = (await url(file)).href;
+      for (const { file } of [{ file: ref.index }, index.skeleton, index.core, ...index.chunks]) urls[file] = absoluteHref(await url(file));
       return { ref, urls, ...(timeoutMs === undefined ? {} : { timeoutMs }) };
     })();
     sources.set(face, source);

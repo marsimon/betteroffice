@@ -94,6 +94,24 @@ test('outlines a frame draws install before it paints, one fetch per chunk acros
   expect(await resident.ensure(new Map([[99, new Set([glyph])]]))).toEqual(new Set());
 });
 
+test('a page-relative slice URL loads from the worker\'s own origin', async () => {
+  const relative: ProgressiveFontSpec = {
+    slot: 0,
+    source: { ref, urls: Object.fromEntries(files.map((file) => [file, `/${file}`])), timeoutMs: 5_000 },
+  };
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'location');
+  Object.defineProperty(globalThis, 'location', { value: { href: new URL('/worker.js', server.url).href }, configurable: true });
+  try {
+    const { resident, logs } = fonts(undefined, [relative]);
+    expect(await resident.ensure(new Map([[10, new Set([glyphIn(41)])]]))).toEqual(new Set([10]));
+    expect(hits.get(chunkFile(41))).toBe(1);
+    expect(logs).toEqual([]);
+  } finally {
+    if (previous) Object.defineProperty(globalThis, 'location', previous);
+    else delete (globalThis as { location?: unknown }).location;
+  }
+});
+
 test('a frame stops waiting at the guard, logs once, and repaints when the outlines arrive', async () => {
   const { resident, logs, updates } = fonts();
   let release!: () => void;
