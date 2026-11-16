@@ -2687,6 +2687,7 @@ pub struct EngineSession {
     partial_document: Cell<bool>,
     /// Resident text edits re-lower only their paragraph when eligible.
     local_lowering: Cell<bool>,
+    float_kinds: RefCell<FloatKindsMemo>,
     /// Body heading levels by paragraph id, for the document version they were read at.
     /// The body's headings, by the document version and body revision they were read at.
     page_text_headings: RefCell<Option<(PageTextHeadingsRead, Rc<HashMap<String, u8>>)>>,
@@ -4415,29 +4416,83 @@ fn certify_retained_blocks(
         .collect()
 }
 
+/// The float kinds of the floating tables, by what classified them. Classifying
+/// a floating table measures it, and typing elsewhere leaves it the same table.
+#[derive(Default)]
+struct FloatKindsMemo {
+    /// The content width, width policy, measurement and page geometry they were
+    /// classified under.
+    config: Option<Fingerprint>,
+    /// Kinds by the table's position-free fingerprint and its width.
+    tables: HashMap<(Fingerprint, u64), (bool, bool)>,
+}
+
 fn resident_float_kinds(
     blocks: &SharedBlocks,
     widths: &[f64],
     float_width_policy: FloatWidthPolicy,
     measurement: &docx_layout::measure_blocks::MeasurementConfig,
     geometry: &docx_layout::measure_blocks::FloatPageGeometry,
+    memo: &RefCell<FloatKindsMemo>,
 ) -> Result<(bool, bool), String> {
     let mut kinds = (false, false);
     let default_width = widths.first().copied().unwrap_or(0.0);
+    let config = crate::fingerprint::fingerprint_without_positions(&(
+        default_width,
+        format!("{float_width_policy:?}"),
+        measurement,
+        float_geometry_key(geometry),
+        docx_layout::measure_fonts_generation(),
+    ))?;
+    let mut memo = memo.borrow_mut();
+    let mut previous = if memo.config == Some(config) {
+        std::mem::take(&mut memo.tables)
+    } else {
+        HashMap::new()
+    };
+    let mut tables = HashMap::new();
     for (index, block) in blocks.iter().enumerate() {
         let width = widths.get(index).copied().unwrap_or(default_width);
-        let next = docx_layout::measure_blocks::floating_zone_kinds_with_width_policy(
-            std::slice::from_ref(block),
-            default_width,
-            &[width],
-            float_width_policy,
-            measurement,
-            Some(geometry),
-        )?;
+        let classify = || {
+            docx_layout::measure_blocks::floating_zone_kinds_with_width_policy(
+                std::slice::from_ref(block),
+                default_width,
+                &[width],
+                float_width_policy,
+                measurement,
+                Some(geometry),
+            )
+        };
+        let next = match block {
+            LayoutBlock::Table(table) if table.floating.is_some() => {
+                let key = (
+                    crate::fingerprint::fingerprint_without_positions(block)?,
+                    width.to_bits(),
+                );
+                let next = match previous.remove(&key) {
+                    Some(next) => next,
+                    None => {
+                        #[cfg(test)]
+                        FLOAT_TABLE_CLASSIFICATIONS.with(|count| count.set(count.get() + 1));
+                        classify()?
+                    }
+                };
+                tables.insert(key, next);
+                next
+            }
+            _ => classify()?,
+        };
         kinds.0 |= next.0;
         kinds.1 |= next.1;
     }
+    memo.config = Some(config);
+    memo.tables = tables;
     Ok(kinds)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FLOAT_TABLE_CLASSIFICATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Whether `block` is, or nests, one of `paragraphs`.
@@ -4500,35 +4555,40 @@ fn nested_block_keys(block: &LayoutBlock, out: &mut Vec<String>) {
     }
 }
 
-fn position_deltas(previous: &LayoutInput, next: &LayoutInput) -> HashMap<String, i64> {
-    previous
-        .measured
-        .iter()
-        .zip(&next.measured)
-        .filter_map(|(previous, next)| {
-            let previous_id = previous.block.block_id()?;
-            let next_id = next.block.block_id()?;
-            let key = block_key(previous_id);
-            if key != block_key(next_id) {
-                return None;
-            }
-            let previous_start = previous.block.pm_start();
-            let next_start = next.block.pm_start();
-            let delta = next_start? as i64 - previous_start? as i64;
-            if delta == 0 {
-                return None;
-            }
-            let mut entries = vec![(key.into_owned(), delta)];
-            // Nested paragraphs (table cells, text boxes, shape text) carry
-            // their own ids on display primitives but shift with the
-            // enclosing block.
-            let mut nested = Vec::new();
-            nested_block_keys(&next.block, &mut nested);
-            entries.extend(nested.into_iter().map(|key| (key, delta)));
-            Some(entries)
-        })
-        .flatten()
-        .collect()
+fn position_deltas(previous_input: &LayoutInput, next_input: &LayoutInput) -> HashMap<String, i64> {
+    let mut deltas = HashMap::new();
+    let mut nested = Vec::new();
+    let blocks = previous_input.measured.iter().zip(&next_input.measured);
+    for (index, (previous, next)) in blocks.enumerate() {
+        let (Some(previous_id), Some(next_id)) = (previous.block.block_id(), next.block.block_id())
+        else {
+            continue;
+        };
+        let key = block_key(previous_id);
+        if key != block_key(next_id) {
+            continue;
+        }
+        let (Some(previous_start), Some(next_start)) =
+            (previous.block.pm_start(), next.block.pm_start())
+        else {
+            continue;
+        };
+        let delta = next_start as i64 - previous_start as i64;
+        if delta == 0 {
+            continue;
+        }
+        if deltas.is_empty() {
+            // the first moved block usually moves every block after it
+            deltas.reserve(next_input.measured.len().saturating_sub(index));
+        }
+        deltas.insert(key.into_owned(), delta);
+        // Nested paragraphs (table cells, text boxes, shape text) carry
+        // their own ids on display primitives but shift with the
+        // enclosing block.
+        nested_block_keys(&next.block, &mut nested);
+        deltas.extend(nested.drain(..).map(|key| (key, delta)));
+    }
+    deltas
 }
 
 fn incremental_eligible_plain(
@@ -5336,6 +5396,7 @@ impl EngineSession {
             font_fingerprints: RefCell::new(HashMap::new()),
             partial_document: Cell::new(false),
             local_lowering: Cell::new(false),
+            float_kinds: RefCell::default(),
             page_text_headings: RefCell::new(None),
             #[cfg(test)]
             preview_refresh: Cell::new(true),
@@ -8159,6 +8220,7 @@ impl EngineSession {
                             float_width_policy,
                             &measurement,
                             &geometry,
+                            &self.float_kinds,
                         )?;
                         has_floats = floats;
                         // margin-relative zones couple the whole flow; re-measure all
@@ -8570,11 +8632,15 @@ impl EngineSession {
         // body. Without notes, this pass's own pagination is such a placement: the
         // pictures are checked against it, and settled and paginated again only when
         // one lands in another frame than it measured in, which typing rarely makes.
-        let only_pictures = resident_body
-            && wraps_only_continuous_pictures(&input, &regions)
-            && input.measured.iter().all(|measured| {
-                collect_note_refs(std::slice::from_ref(&measured.block)).is_empty()
-            });
+        // Settling and flow wrapping measure the blocks again but keep their runs,
+        // so the note references read here are the final pass's.
+        let refs = input
+            .measured
+            .iter()
+            .flat_map(|measured| collect_note_refs(std::slice::from_ref(&measured.block)))
+            .collect::<Vec<_>>();
+        let only_pictures =
+            resident_body && refs.is_empty() && wraps_only_continuous_pictures(&input, &regions);
         let settle_pictures = (only_pictures && self.pictures_settled.get()).then(|| {
             let spacing =
                 PlacementSpacing::record(input.measured.iter().map(|measured| &measured.block));
@@ -8619,11 +8685,6 @@ impl EngineSession {
             }
             None => measured_fingerprints(&input)?,
         };
-        let refs = input
-            .measured
-            .iter()
-            .flat_map(|measured| collect_note_refs(std::slice::from_ref(&measured.block)))
-            .collect::<Vec<_>>();
         let previous_notes = note_page_keys_plain(self.pagination.borrow().layout.as_ref());
         // The note fixpoint replays `base_input`. Without notes `input` is the
         // final pass; with notes the final pass carries reserved heights, so
@@ -11929,6 +11990,7 @@ impl EngineSession {
                             float_width_policy,
                             measurement.as_ref(),
                             &geometry,
+                            &self.float_kinds,
                         )?
                         .0
                     {
@@ -21381,6 +21443,119 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
                 assert_certified_float_cold(&engine, &request, &mut retained);
             }
         }
+    }
+
+    #[test]
+    fn typing_before_floating_tables_classifies_them_once() {
+        let fonts = docx_layout::MeasureFonts::default();
+        let _scope = fonts.enter();
+        let font = docx_layout::register_measure_font_bytes(lowering_pages::FONT).unwrap();
+        let bytes = floated_body(|index| {
+            (index % 50 == 10).then(|| floating_table(r#"w:vertAnchor="text""#, index))
+        });
+        let engine = EngineSession::new(9637);
+        crate::seed_from_docx(engine.doc(), &bytes).unwrap();
+        engine.set_local_lowering(true);
+        let request = lowering_pages::region_request(&engine, &bytes, font).to_string();
+        let classified = || FLOAT_TABLE_CLASSIFICATIONS.with(Cell::get);
+        let before = classified();
+        engine
+            .layout_document_with_regions_retained_json(&request)
+            .unwrap();
+        assert!(engine.pagination.borrow().measured_with_floats);
+        assert_eq!(classified() - before, 4, "each table is classified once");
+        let first = {
+            let pagination = engine.pagination.borrow();
+            let LayoutBlock::Paragraph(paragraph) =
+                &pagination.input.as_ref().unwrap().measured[0].block
+            else {
+                panic!("expected the first paragraph");
+            };
+            block_key(&paragraph.id).into_owned()
+        };
+        let mut retained = HashMap::new();
+        assert_certified_float_cold(&engine, &request, &mut retained);
+        let mut typed = 0;
+        for text in ["x", "y", "z"] {
+            // before every table, so each one moves
+            let offset = engine
+                .doc()
+                .paragraph_index("body")
+                .unwrap()
+                .para_span(&first)
+                .unwrap()
+                .0
+                + 1;
+            engine
+                .edit_resident_text(
+                    crate::StoryRange::new("body", offset, offset),
+                    Some(text),
+                    true,
+                )
+                .unwrap();
+            let before = classified();
+            engine
+                .layout_document_with_regions_after_edit(&request, Some("body"))
+                .unwrap();
+            typed += classified() - before;
+            // the cold session classifies its own
+            assert_certified_float_cold(&engine, &request, &mut retained);
+        }
+        assert_eq!(typed, 0, "moved tables keep their kinds");
+    }
+
+    #[test]
+    fn a_changed_floating_table_is_classified_again() {
+        let fonts = docx_layout::MeasureFonts::default();
+        let _scope = fonts.enter();
+        let font = docx_layout::register_measure_font_bytes(lowering_pages::FONT).unwrap();
+        let bytes = floated_body(|index| {
+            (index % 50 == 10).then(|| floating_table(r#"w:vertAnchor="text""#, index))
+        });
+        let engine = EngineSession::new(9638);
+        crate::seed_from_docx(engine.doc(), &bytes).unwrap();
+        let request = lowering_pages::region_request(&engine, &bytes, font).to_string();
+        engine
+            .layout_document_with_regions_retained_json(&request)
+            .unwrap();
+        let blocks = Rc::clone(&engine.render.borrow().stories["body"].blocks);
+        let widths = engine.pagination.borrow().measured_widths.clone();
+        let input: RegionLayoutInput = serde_json::from_str(&request).unwrap();
+        let (mut layout_input, regions, _, _, _, _) = input.split();
+        apply_section_geometry(&mut layout_input, &regions);
+        let geometry = initial_float_page_geometry(&layout_input, &regions);
+        let measurement: docx_layout::measure_blocks::MeasurementConfig =
+            serde_json::from_value(serde_json::from_str::<serde_json::Value>(&request).unwrap()["measurement"].clone())
+                .unwrap();
+        let policy = FloatWidthPolicy::for_document(blocks.iter());
+        let kinds = |blocks: &SharedBlocks| {
+            let before = FLOAT_TABLE_CLASSIFICATIONS.with(Cell::get);
+            let kinds = resident_float_kinds(
+                blocks,
+                &widths,
+                policy,
+                &measurement,
+                &geometry,
+                &engine.float_kinds,
+            )
+            .unwrap();
+            (kinds, FLOAT_TABLE_CLASSIFICATIONS.with(Cell::get) - before)
+        };
+        assert_eq!(kinds(&blocks), ((true, false), 4));
+        assert_eq!(kinds(&blocks), ((true, false), 0));
+        let mut changed = SharedBlocks::from(blocks.to_vec());
+        let table = changed
+            .shared_mut()
+            .iter_mut()
+            .find(|block| matches!(block.as_ref(), LayoutBlock::Table(_)))
+            .unwrap();
+        let LayoutBlock::Table(table) = Rc::make_mut(table) else {
+            unreachable!()
+        };
+        table.width = Some(table.width.unwrap_or(1800.0) / 2.0);
+        assert_eq!(kinds(&changed), ((true, false), 1));
+        assert_eq!(kinds(&changed), ((true, false), 0));
+        assert_eq!(kinds(&blocks), ((true, false), 1), "only the kinds in use are kept");
     }
 
     #[test]
