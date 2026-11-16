@@ -381,6 +381,105 @@ fn a_resident_frame_paints_an_arabic_word_from_its_measured_glyphs() {
 }
 
 #[test]
+fn a_table_cell_caret_comes_from_the_resident_layout() {
+    let session = core(1);
+    let seeded: Value = serde_json::from_str(&session.load_json(BODY).unwrap()).unwrap();
+    let para_id = seeded["body"][0].as_str().unwrap();
+    session
+        .insert_table("body", para_id, 5, 1, 2, None, None)
+        .unwrap();
+    let payload: Value =
+        serde_json::from_str(&session.table_payload("body", 0).unwrap().unwrap()).unwrap();
+    let cell = payload["rows"][0]["cells"][1]["story"].as_str().unwrap().to_owned();
+    session
+        .insert_text(&cell, &paragraph_id(&session, &cell), 0, "Cell text", None, None)
+        .unwrap();
+    let cell_para = paragraph_id(&session, &cell);
+    let font = session
+        .register_measure_font(include_bytes!(
+            "../../../ooxml-text/tests/fonts/LiberationSans-Regular.ttf"
+        ))
+        .unwrap();
+    let request = serde_json::json!({
+        "bodyStory": "body",
+        "regions": {"sections": [{
+            "sectionId": "main",
+            "properties": {
+                "pageWidth": 4320,
+                "pageHeight": 2880,
+                "marginTop": 300,
+                "marginRight": 300,
+                "marginBottom": 300,
+                "marginLeft": 300
+            }
+        }]},
+        "measurement": {
+            "fontChains": {"calibri|0|0": [font]},
+            "defaults": {"fontSize": 11, "fontFamily": "Calibri"},
+            "authoritativeShaping": true
+        },
+        "renderEnv": {}
+    });
+    session
+        .layout_document_with_regions_json(&request.to_string())
+        .unwrap();
+    session
+        .build_display_list_frame(
+            &serde_json::json!({"fontChains": {"calibri|0|0": [font]}}).to_string(),
+            0.0,
+        )
+        .unwrap();
+    let caret_at = |offset: u32| {
+        session
+            .set_selection(&cell, &cell_para, offset, &cell_para, offset)
+            .unwrap();
+        let caret: Value =
+            serde_json::from_str(&session.resident_caret_snapshot_json().unwrap()).unwrap();
+        assert!(caret["caretRect"].is_object(), "a collapsed cell caret has geometry: {caret}");
+        caret["caretRect"].clone()
+    };
+    let start = caret_at(0);
+    let inside = caret_at(4);
+    assert_eq!(start["pageIndex"], inside["pageIndex"]);
+    assert_eq!(start["y"], inside["y"]);
+    assert!(inside["x"].as_f64().unwrap() > start["x"].as_f64().unwrap());
+    // the caret is the one the display list draws at the position a hit there resolves to
+    let hit: Value = serde_json::from_str(
+        &session
+            .display_hit_test_regions_json(
+                inside["pageIndex"].as_u64().unwrap() as u32,
+                inside["x"].as_f64().unwrap(),
+                inside["y"].as_f64().unwrap() + inside["height"].as_f64().unwrap() / 2.0,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(hit["target"], "text");
+    let hit_pos = hit["pos"].as_i64().unwrap();
+    let hit_caret = session
+        .engine
+        .with_display_list(|list| docx_layout::hit::caret_rect(list, hit_pos))
+        .unwrap()
+        .unwrap();
+    let hit_caret = serde_json::to_value(hit_caret).unwrap();
+    for key in ["pageIndex", "x", "y", "height"] {
+        assert_eq!(hit_caret[key], inside[key], "{key}");
+    }
+    // a selection across cells keeps leaving the caret to the worker
+    session
+        .set_selection(&cell, &cell_para, 0, &cell_para, 4)
+        .unwrap();
+    let ranged: Value =
+        serde_json::from_str(&session.resident_caret_snapshot_json().unwrap()).unwrap();
+    assert!(ranged["caretRect"].is_null());
+}
+
+fn paragraph_id(session: &EditSessionCore, story: &str) -> String {
+    let spans: Value = serde_json::from_str(&session.paragraph_spans(story).unwrap()).unwrap();
+    spans[0]["paraId"].as_str().unwrap().to_owned()
+}
+
+#[test]
 fn fonts_layout_frames_and_resident_input_run_without_wasm() {
     let session = core(1);
     let seeded: Value = serde_json::from_str(&session.load_json(BODY).unwrap()).unwrap();

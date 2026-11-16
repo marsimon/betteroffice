@@ -2995,6 +2995,31 @@ fn resident_paragraph_position(input: &LayoutInput, para_id: &str, offset: u32) 
     paragraph_offset_position(start, offset)
 }
 
+/// [`resident_paragraph_position`] for a paragraph of a table cell, nested tables included: the
+/// first block lowered from `para_id`, under the same plain-runs rule.
+fn resident_cell_paragraph_position(input: &LayoutInput, para_id: &str, offset: u32) -> Option<i64> {
+    fn start_of(block: &LayoutBlock, para_id: &str) -> Option<Option<f64>> {
+        match block {
+            LayoutBlock::Table(table) => table
+                .rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .flat_map(|cell| &cell.blocks)
+                .find_map(|nested| start_of(nested, para_id)),
+            LayoutBlock::Paragraph(paragraph) if block_key(&paragraph.id) == para_id => {
+                Some(paragraph_identity(block).and_then(|(_, start)| start))
+            }
+            _ => None,
+        }
+    }
+    let start = input
+        .measured
+        .iter()
+        .filter(|measured| matches!(measured.block, LayoutBlock::Table(_)))
+        .find_map(|measured| start_of(&measured.block, para_id))??;
+    paragraph_offset_position(start, offset)
+}
+
 /// The display positions every block lowered from the paragraph `para_id` spans,
 /// in table cells too.
 fn resident_paragraph_span(input: &LayoutInput, para_id: &str) -> Option<(f64, f64)> {
@@ -12731,7 +12756,9 @@ impl EngineSession {
     ) -> Result<ResidentCaretSnapshot, String> {
         let position = paragraph.and_then(|(para_id, offset)| {
             let pagination = self.pagination.borrow();
-            resident_paragraph_position(pagination.input.as_ref()?, para_id, offset)
+            let input = pagination.input.as_ref()?;
+            resident_paragraph_position(input, para_id, offset)
+                .or_else(|| resident_cell_paragraph_position(input, para_id, offset))
         });
         let display = self.display.borrow();
         let frame_epoch = display.binary_frame_epoch;
