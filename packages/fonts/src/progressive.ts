@@ -105,13 +105,12 @@ const opened = new WeakMap<ProgressiveFontFace, [SliceRef, SliceIndex, SliceTran
 const sources = new WeakMap<ProgressiveFontFace, Promise<SliceSource>>();
 
 /**
- * The absolute address of `url`. A bundler may hand out asset URLs whose `href` is relative to the page
- * (webpack's `url: 'relative'`, which Next uses), and another realm cannot fetch those, so they resolve
- * against this realm's location as asset bases do.
+ * The href a worker can fetch. A bundler can name an asset with a URL-like object whose href is only
+ * the served path (Turbopack compiles `new URL(asset, import.meta.url)` so); this realm resolves it
+ * against its location, but the worker these hrefs are sent to cannot.
  */
 function absoluteHref(url: URL): string {
-  const href = String(url.href);
-  return typeof location === 'undefined' ? new URL(href).href : new URL(href, location.href).href;
+  return new URL(url.href, globalThis.location?.href).href;
 }
 
 /** @internal The files of a face `openProgressiveFace` opened with a transport that names URLs. */
