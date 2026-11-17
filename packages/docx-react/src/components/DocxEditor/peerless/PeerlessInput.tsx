@@ -266,11 +266,11 @@ export function PeerlessInput(props: PeerlessInputProps): ReactElement | null {
       }, event);
       element.value = '';
     };
-    const compositionstart = () => {
+    const compositionstart = (event: CompositionEvent) => {
       clearEscape();
       if (composition || isReadOnly()) return;
       const id = ++nextEventId;
-      composition = beginComposition(admission, id);
+      composition = beginComposition(admission, id, event.timeStamp);
       composing.current = true;
       state = { ...state, composing: true, compositionId: id, trailingCompositionText: null };
       active = null;
@@ -278,10 +278,10 @@ export function PeerlessInput(props: PeerlessInputProps): ReactElement | null {
     };
     const compositionupdate = (event: CompositionEvent) => {
       if (!composition) return;
-      composition = updateComposition(composition, event.data ?? element.value);
+      composition = updateComposition(composition, event.data ?? element.value, admission, event.timeStamp);
       callbacks.current.onCompositionChange?.(composition);
     };
-    const finishComposition = (text: string) => {
+    const finishComposition = (text: string, inputTime?: number) => {
       if (!composition) return;
       const current = composition;
       composition = null;
@@ -295,7 +295,7 @@ export function PeerlessInput(props: PeerlessInputProps): ReactElement | null {
       };
       let result: PeerlessCompositionEndResult;
       try {
-        result = endComposition(admission, current, text);
+        result = endComposition(admission, current, text, inputTime);
       } catch {
         element.value = '';
         recover({ ...current, text });
@@ -311,7 +311,7 @@ export function PeerlessInput(props: PeerlessInputProps): ReactElement | null {
         }, () => recover(committed));
       } else if (result.state.recoverableText) callbacks.current.onRecoverableText?.(result.state.recoverableText);
     };
-    const compositionend = (event: CompositionEvent) => finishComposition(event.data ?? composition?.text ?? element.value);
+    const compositionend = (event: CompositionEvent) => finishComposition(event.data ?? composition?.text ?? element.value, event.timeStamp);
     const blur = () => { clearEscape(); if (composition) finishComposition(composition.text); active = null; };
     const copy = (event: ClipboardEvent) => {
       if (takeClipboardGesture(element) === 'ignore') { event.preventDefault(); return; }
