@@ -124,7 +124,8 @@ impl EditingDoc {
 
     /// Whether text typed at `at` with the cursor's `marks` ends with other formatting than
     /// text typed there without them: [`Self::caret_marked`] of the formatting the insertion
-    /// point gives typed text. Typing where it is `false` is plain typing.
+    /// point gives typed text. Typing where it is `false` is plain typing. Like typing, it reads
+    /// the caret's paragraph through the story's indexes where they are current.
     pub(crate) fn caret_marks_change_typing(
         &self,
         at: Position,
@@ -133,12 +134,18 @@ impl EditingDoc {
         let txn = self.yrs_doc().transact();
         let story = story_ref(&txn, &at.story)?;
         check_position(&story, &txn, at.index)?;
-        let mut index = past_leading_blocks_indexed(&story, &txn, at.index, None);
-        let chunks = position_chunks_indexed(&story, &txn, &mut index, None);
+        let indexed = IndexedStory::committed(self, &at.story);
+        let mut index = past_leading_blocks_indexed(&story, &txn, at.index, indexed.as_ref());
+        let chunks = position_chunks_indexed(&story, &txn, &mut index, indexed.as_ref());
         let formatting = insertion_attrs(&chunks, index, &FormatPolicy::Inherit, &txn);
+        let bounds = indexed
+            .as_ref()
+            .and_then(|indexed| indexed.bounds_at(&txn, index))
+            .filter(|bounds| bounds.start <= index && index <= bounds.pilcrow);
         Ok(self
-            .caret_marked(&formatting, marks, || {
-                crate::format::paragraph_key_at(&story, &txn, index)
+            .caret_marked(&formatting, marks, || match bounds {
+                Some(bounds) => Some(bounds.para_id),
+                None => crate::format::paragraph_key_at(&story, &txn, index),
             })
             .is_some())
     }

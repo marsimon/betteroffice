@@ -1015,6 +1015,11 @@ fn caret_marks_change_typing_exactly_where_typing_with_them_differs_from_plain_t
         .find(|story| story.kind == crate::StoryInfoKind::TableCell)
         .unwrap()
         .story;
+    // like typing, the query reads the caret's paragraph through the story's current indexes
+    for story in ["body", cell.as_str()] {
+        probe.doc().segment_index(story).unwrap();
+    }
+    let unindexed = || crate::ops::UNINDEXED_WINDOWS.with(std::cell::Cell::get);
     let ctx = EditCtx::local("", "");
     let mut seen = [false, false];
     for delta in [
@@ -1028,10 +1033,12 @@ fn caret_marks_change_typing_exactly_where_typing_with_them_differs_from_plain_t
         for story in ["body", cell.as_str()] {
             let len = probe.doc().story_len(story).unwrap() - 1;
             for at in 0..=len {
+                let walked = unindexed();
                 let changes = probe
                     .doc()
                     .caret_marks_change_typing(Position::new(story, at), &marks)
                     .unwrap();
+                assert_eq!(unindexed(), walked, "{story} {at}: walked the story");
                 let plain = seeded();
                 let marked = seeded();
                 let typed = plain.doc().insert_text(
@@ -1059,6 +1066,22 @@ fn caret_marks_change_typing_exactly_where_typing_with_them_differs_from_plain_t
         }
     }
     assert_eq!(seen, [true, true], "both answers occur");
+    // without current indexes it walks the story, and answers alike
+    let delta = parse_inline_format_delta(json!({"bold": true}).as_object().unwrap()).unwrap();
+    let marks = CaretMarks::new(&delta).unwrap();
+    let walked = unindexed();
+    let cold = seeded()
+        .doc()
+        .caret_marks_change_typing(Position::new("body", 1), &marks)
+        .unwrap();
+    assert!(unindexed() > walked);
+    assert_eq!(
+        cold,
+        probe
+            .doc()
+            .caret_marks_change_typing(Position::new("body", 1), &marks)
+            .unwrap()
+    );
 }
 
 #[test]

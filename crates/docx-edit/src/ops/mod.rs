@@ -47,6 +47,11 @@ impl IndexedStory {
         if !txn.insert_set().is_empty() || !txn.delete_set().is_empty() {
             return None;
         }
+        Self::committed(doc, story_id)
+    }
+
+    /// The indexes of the committed document, for a read that makes no edits of its own.
+    pub(crate) fn committed(doc: &crate::EditingDoc, story_id: &str) -> Option<Self> {
         let epoch = doc.committed_epoch();
         let segments = doc.segment_indexes.lock().unwrap().get(story_id, epoch)?;
         segments.formatted_segment_units()?;
@@ -404,11 +409,19 @@ fn snapshot_window_indexed<T: ReadTxn>(
     {
         return chunks;
     }
+    #[cfg(test)]
+    UNINDEXED_WINDOWS.with(|windows| windows.set(windows.get() + 1));
     if through_embeds {
         snapshot_range_through_embeds(story, txn, lo, hi)
     } else {
         snapshot_range(story, txn, lo, hi)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Windows read by walking the story because no current index held them.
+    pub(crate) static UNINDEXED_WINDOWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether the chunks a removal gets still hold the units after it.
