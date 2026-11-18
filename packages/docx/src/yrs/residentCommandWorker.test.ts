@@ -3784,6 +3784,64 @@ function paintedLine(frame: RetainedFrame, page: number, y: number, text: string
   return { text, y, glyphs: runs.flatMap((run) => run.glyphs.map((glyph) => ({ id: glyph.id, x: glyph.x, fontId: run.fontId }))) };
 }
 
+/**
+ * Sends commands as the main thread does, holding the frame, the echo context and the glyph sets
+ * the worker ships, and checks every key the context predicts against the frame that follows.
+ */
+function echoParity(client: ResidentEngineWorkerClient, initial: Pick<DocxCommandAck, 'frame'>) {
+  const sets = new Map<string, DocxEchoGlyphSet>();
+  const state = {
+    frame: null as RetainedFrame | null, context: undefined as DocxCommandEchoContext | undefined, echoed: 0,
+    seq: 0, version: 0,
+  };
+  const receive = (ack: Pick<DocxCommandAck, 'frame'>) => {
+    for (const set of ack.frame!.payload.echoGlyphSets ?? []) {
+      const base = set.extends === undefined ? undefined : sets.get(set.extends);
+      if (set.extends !== undefined && !base) throw new Error('a grown set arrived before its base');
+      sets.set(set.key, base ? { ...set, kerning: [...base.kerning, ...set.kerning],
+        unsafePairs: [...base.unsafePairs, ...set.unsafePairs], outlines: { ...base.outlines, ...set.outlines } } : set);
+    }
+    state.frame = applyFrameDeltaOwned(state.frame, decodeFrameDelta(ack.frame!.payload.frame));
+    state.context = ack.frame!.payload.echoContext;
+  };
+  receive(initial);
+  const send = async (kind: string, payload: DocxCommandEnvelope['payload']) => {
+    state.seq += 1;
+    const ack = await editWithFrame(client, intent(state.seq, state.version, kind, payload));
+    expect(ack.outcomes[0]?.status).toBe(kind === 'select' ? 'noop' : 'applied');
+    state.version = ack.version;
+    receive(ack);
+  };
+  const key = async (edit: { insert: string } | { deleteBackward: true }) => {
+    const context = state.context;
+    const predicted = context && predictEcho(context, sets, edit);
+    const page = context?.page.pageIndex ?? 0;
+    // a cell's line ends at its right edge; the next cell's text shares its baseline
+    const right = context?.glyphs?.right ?? Infinity;
+    await send('insert' in edit ? 'insertText' : 'deleteBackward', 'insert' in edit ? { text: edit.insert } : {});
+    if (!predicted) return false;
+    expect(paintedLine(state.frame!, page, predicted.y, predicted.text, right)).toEqual(predicted);
+    state.echoed += 1;
+    return true;
+  };
+  return {
+    send, key,
+    /** A command that leaves the document as it is, as formatting with nothing selected does. */
+    async quiet(kind: string, payload: DocxCommandEnvelope['payload']) {
+      state.seq += 1;
+      const ack = await client.edit(intent(state.seq, state.version, kind, payload));
+      expect(ack.outcomes[0]?.status).toBe('noop');
+      state.version = ack.version;
+      if (ack.frame) receive(ack);
+      else state.context = undefined;
+      return ack;
+    },
+    get frame() { return state.frame; },
+    get context() { return state.context; },
+    get echoed() { return state.echoed; },
+  };
+}
+
 test('typed Hangul and Latin echo glyph for glyph where the engine then paints them, in mixed-font body and cell lines', async () => {
   // Latin slots name the Latin font and the East Asian slot the Korean one, as Korean documents do
   const korean = '<w:rFonts w:ascii="Liberation Sans" w:hAnsi="Liberation Sans" w:eastAsia="Noto Sans KR"/>';
@@ -3800,44 +3858,11 @@ test('typed Hangul and Latin echo glyph for glyph where the engine then paints t
   const { client, engine, initial } = await openWorker({ bodyXml, korean: true,
     prepare: () => ({ story: 'body', paraId: '00000001', offset: 2 }) });
   try {
-    const sets = new Map<string, DocxEchoGlyphSet>();
-    let frame: RetainedFrame | null = null;
-    let context: DocxCommandEchoContext | undefined;
-    let seq = 0;
-    const receive = (ack: Pick<DocxCommandAck, 'frame'>) => {
-      for (const set of ack.frame!.payload.echoGlyphSets ?? []) {
-        const base = set.extends === undefined ? undefined : sets.get(set.extends);
-        if (set.extends !== undefined && !base) throw new Error('a grown set arrived before its base');
-        sets.set(set.key, base ? { ...set, kerning: [...base.kerning, ...set.kerning],
-          unsafePairs: [...base.unsafePairs, ...set.unsafePairs], outlines: { ...base.outlines, ...set.outlines } } : set);
-      }
-      frame = applyFrameDeltaOwned(frame, decodeFrameDelta(ack.frame!.payload.frame));
-      context = ack.frame!.payload.echoContext;
-    };
-    receive(initial);
-    let version = 0;
-    const send = async (kind: string, payload: DocxCommandEnvelope['payload']) => {
-      seq += 1;
-      const ack = await editWithFrame(client, intent(seq, version, kind, payload));
-      expect(ack.outcomes[0]?.status).toBe(kind === 'select' ? 'noop' : 'applied');
-      version = ack.version;
-      receive(ack);
-    };
-    let echoed = 0;
-    const key = async (edit: { insert: string } | { deleteBackward: true }) => {
-      const predicted = context && predictEcho(context, sets, edit);
-      const page = context?.page.pageIndex ?? 0;
-      // a cell's line ends at its right edge; the next cell's text shares its baseline
-      const right = context?.glyphs?.right ?? Infinity;
-      await send('insert' in edit ? 'insertText' : 'deleteBackward', 'insert' in edit ? { text: edit.insert } : {});
-      if (!predicted) return false;
-      expect(paintedLine(frame!, page, predicted.y, predicted.text, right)).toEqual(predicted);
-      echoed += 1;
-      return true;
-    };
+    const parity = echoParity(client, initial);
+    const { send, key } = parity;
     // the first key only brings the line's echo context
     await send('insertText', { text: '나' });
-    expect(context?.glyphs?.faces?.length).toBeGreaterThan(1);
+    expect(parity.context?.glyphs?.faces?.length).toBeGreaterThan(1);
     // Hangul after Hangul, Latin after Hangul (auto-spaced), a digit, a space, and backspaces
     for (const edit of [{ insert: '한' }, { insert: 'e' }, { insert: '가' }, { insert: '1' }, { insert: ' ' },
       { deleteBackward: true as const }, { deleteBackward: true as const }]) {
@@ -3848,11 +3873,11 @@ test('typed Hangul and Latin echo glyph for glyph where the engine then paints t
     const inCell = { story: 'body:t0:r0c0', paraId: cellParagraph, offset: 1 };
     await send('select', { selection: { anchor: inCell, focus: inCell } });
     await send('insertText', { text: '시' });
-    expect(context?.glyphs?.letterSpacing).toBe(Math.fround(-4 / 20 * 96 / 72));
+    expect(parity.context?.glyphs?.letterSpacing).toBe(Math.fround(-4 / 20 * 96 / 72));
     // the echo paints inside the cell's clip, as the page raster does
-    const clipped = frame!.pages[0]!.page.primitives.find((primitive): primitive is GlyphRunPrimitive =>
+    const clipped = parity.frame!.pages[0]!.page.primitives.find((primitive): primitive is GlyphRunPrimitive =>
       primitive.kind === 'glyphRun' && primitive.clipGroup?.id?.endsWith(':t0:r0c0-r0-c0') === true);
-    expect(context?.glyphs?.clip).toEqual(clipped!.clipGroup!.clip as { x: number; y: number; w: number; h: number });
+    expect(parity.context?.glyphs?.clip).toEqual(clipped!.clipGroup!.clip as { x: number; y: number; w: number; h: number });
     for (const edit of [{ insert: '간' }, { insert: 'c' }, { deleteBackward: true as const }]) {
       expect(await key(edit)).toBe(true);
     }
@@ -3861,11 +3886,44 @@ test('typed Hangul and Latin echo glyph for glyph where the engine then paints t
     const inHangul = { story: 'body', paraId: hangulLine, offset: 3 };
     await send('select', { selection: { anchor: inHangul, focus: inHangul } });
     await send('insertText', { text: '다' });
-    expect(context?.glyphs?.typed?.join('')).toContain('가');
-    expect(context?.glyphs?.typed?.join('')).not.toContain('e');
+    expect(parity.context?.glyphs?.typed?.join('')).toContain('가');
+    expect(parity.context?.glyphs?.typed?.join('')).not.toContain('e');
     expect(await key({ insert: '나' })).toBe(true);
     expect(await key({ insert: 'e' })).toBe(false);
-    expect(echoed).toBe(11);
+    expect(parity.echoed).toBe(11);
+  } finally { client.destroy(); }
+}, TIMEOUT);
+
+test('keys typed with Ctrl+B echo once the text left of the caret has that formatting', async () => {
+  const korean = '<w:rFonts w:ascii="Liberation Sans" w:hAnsi="Liberation Sans" w:eastAsia="Noto Sans KR"/>';
+  const { client, engine, initial } = await openWorker({ korean: true,
+    bodyXml: `<w:p w14:paraId="00000001"><w:r><w:rPr>${korean}</w:rPr><w:t xml:space="preserve">가나 echo 한국 text</w:t></w:r></w:p>`,
+    prepare: () => ({ story: 'body', paraId: '00000001', offset: 2 }) });
+  try {
+    const parity = echoParity(client, initial);
+    const { send, key } = parity;
+    await send('insertText', { text: '나' });
+    expect(parity.context?.glyphs).toBeDefined();
+    const toggled = await parity.quiet('toggleMark', { mark: { type: 'bold' } });
+    expect(toggled.editState?.storedMarks).toMatchObject({ delta: { bold: true } });
+    expect(parity.context).toBeUndefined();
+    // the first key goes in bold beside plain text: no echo, and the engine draws a run of its own
+    expect(await key({ insert: '다' })).toBe(false);
+    const bold = (start: number, end: number) => engine.selectionContext({ story: 'body',
+      start: { paraId: '00000001', offset: start }, end: { paraId: '00000001', offset: end } }).bold;
+    expect(bold(3, 4)).toBe(true);
+    // the cursor formatting stays, but typing after bold text is bold text either way
+    expect(parity.context?.glyphs).toBeDefined();
+    // (syllables the paragraph holds: the glyph sets carry the paragraph's characters)
+    for (const edit of [{ insert: '한' }, { insert: 'b' }, { insert: ' ' }, { deleteBackward: true as const },
+      { deleteBackward: true as const }, { deleteBackward: true as const }]) {
+      expect(await key(edit)).toBe(true);
+    }
+    expect(bold(3, 4)).toBe(true);
+    // with the bold text gone, the next key would go in bold beside plain text again
+    await send('deleteBackward', {});
+    expect(parity.context).toBeUndefined();
+    expect(parity.echoed).toBe(6);
   } finally { client.destroy(); }
 }, TIMEOUT);
 

@@ -617,13 +617,21 @@ function bindResidentCommands(init: DocxCommandInitRequest): DocxCommandHost {
     }
   };
   let revision = 0;
+  // the echo draws typing as plain typing at the caret, which cursor formatting may change
+  const storedMarksChangeTyping = () => {
+    const stored = hooks.editState().storedMarks;
+    if (!stored) return false;
+    const focus = hooks.selection()?.focus;
+    if (stored.clear || !focus || focus.story !== stored.story || focus.paraId !== stored.paraId) return true;
+    return engine.caretMarksChangeTyping?.(stored.story, stored.paraId, focus.offset, stored.delta) !== false;
+  };
   const host = createResidentCommandHost({
     init,
     registry: { handlers: {}, policies: {} },
     selectionAck: {
       echoContext() {
         if (layoutDirty || !retainedFrame || retainedFrame.frameEpoch !== revision ||
-          retainedLayoutVersion !== engine.proposalEngine.version() || hooks.editState().storedMarks ||
+          retainedLayoutVersion !== engine.proposalEngine.version() || storedMarksChangeTyping() ||
           !echoGlyphState || echoGlyphState.engine !== engine || echoGlyphState.cache !== glyphCache) return undefined;
         const projected = projectCommandEchoContext({
           engine: engine as DocxWorkerCommandEngine, selection: hooks.selection(),
@@ -990,7 +998,7 @@ function bindResidentCommands(init: DocxCommandInitRequest): DocxCommandHost {
         const echoRaster = changes.echoRaster;
         if (echoRaster && echoRaster.pixelRatio !== pixelRatio) pendingOffscreenPageIds.add(echoRaster.pageId);
         const echoGlyphs = commandEchoGlyphs(glyphCache, engine, full);
-        const projectedEcho = hooks.editState().storedMarks ? undefined : projectCommandEchoContext({
+        const projectedEcho = storedMarksChangeTyping() ? undefined : projectCommandEchoContext({
           engine: engine as DocxWorkerCommandEngine, selection: hooks.selection(), layout,
           glyphs: echoGlyphs.provider(pixelRatio),
         });

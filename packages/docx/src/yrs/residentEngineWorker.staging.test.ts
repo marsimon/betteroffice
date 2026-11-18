@@ -88,6 +88,8 @@ async function stageRequestedPages(requested: number[], damaged: number[] = [], 
     fonts: { snapshot: undefined },
     finalizeResidentFrame: async () => ({ bytes, delta, caret: { frameEpoch: 7, caretRect: null } }),
     hooks: { editState: () => ({ storedMarks: null }), selection: () => null },
+    // no stored marks: typing takes the caret's own formatting
+    storedMarksChangeTyping: () => false,
     projectCommandEchoContext: () => echoContext,
     commandEchoGlyphs: () => ({ provider: () => undefined,
       unsent: (context?: DocxCommandEchoContext) => context?.glyphs ? [echoGlyphSet] : [], sent() {} }),
