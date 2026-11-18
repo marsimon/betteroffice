@@ -166,7 +166,7 @@ fn display_reset_clears_damage_on_both_paths() {
             display_rebuilt_pages: BTreeSet::from([2]),
             display_layout_pending: true,
             display_full_rebuild: true,
-            position_deltas: HashMap::from([("body".to_owned(), 1)]),
+            position_deltas: HashMap::from([("body".to_owned(), 1)]).into(),
             note_changed_pages: vec![3],
             restamped_pages: Some(BTreeSet::from([4])),
             ..Default::default()
@@ -639,7 +639,7 @@ fn interactive_page_build_before_frame_matches_cold_frame_bytes() {
         assert!(!pagination.display_uses_region_path);
         assert!(pagination.has_display_damage());
         assert!(!pagination.display_full_rebuild);
-        assert_eq!(pagination.position_deltas.get("73000007"), Some(&1));
+        assert_eq!(pagination.position_deltas.get("73000007"), Some(1));
         assert!(!pagination.pending_display_pages().any(|index| index == 6));
     }
     let built = {

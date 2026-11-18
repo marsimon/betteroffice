@@ -1088,6 +1088,22 @@ fn table_at<T: ReadTxn>(txn: &T, locator: &TableLocator) -> OpResult<(TextRef, M
     })
 }
 
+/// The table embeds of `story` in ordinal order, each with its story offset.
+pub(crate) fn table_embeds_in<T: ReadTxn>(story: &TextRef, txn: &T) -> Vec<(u32, MapRef)> {
+    let mut offset = 0u32;
+    let mut tables = Vec::new();
+    for diff in story.diff(txn, YChange::identity) {
+        let len = out_len(&diff.insert);
+        if let Out::YMap(map) = diff.insert
+            && map_string(&map, txn, KIND_KEY).as_deref() == Some("table")
+        {
+            tables.push((offset, map));
+        }
+        offset += len;
+    }
+    tables
+}
+
 fn checked_rect(data: &TableData, range: &TableRange) -> OpResult<Rect> {
     if range.anchor.story != range.head.story || range.anchor.table_index != range.head.table_index
     {
@@ -1770,8 +1786,31 @@ impl EditingDoc {
     /// gives it, without reading the rest of the story's segments.
     pub fn table_payload(&self, locator: &TableLocator) -> OpResult<BTreeMap<String, Any>> {
         let txn = self.yrs_doc().transact();
-        let (_, table, _) = table_at(&txn, locator)?;
+        let (table, _) = self.cached_table_at(&txn, locator)?;
         Ok(crate::embed_payload(&table, &txn))
+    }
+
+    /// [`table_at`] for reads outside a write: the table embed and its story offset, through the
+    /// story's cached table embeds.
+    fn cached_table_at<T: ReadTxn>(
+        &self,
+        txn: &T,
+        locator: &TableLocator,
+    ) -> OpResult<(MapRef, u32)> {
+        let unknown = || OpError::UnknownTable {
+            story: locator.story.clone(),
+            table_index: locator.table_index,
+        };
+        let story = match story_ref(txn, &locator.story) {
+            Ok(story) => story,
+            Err(crate::EditError::CellHasNoStory(_)) => return Err(unknown()),
+            Err(error) => return Err(error.into()),
+        };
+        let embeds = self.table_embeds(&locator.story, &story, txn);
+        embeds
+            .get(locator.table_index as usize)
+            .map(|(offset, table)| (table.clone(), *offset))
+            .ok_or_else(unknown)
     }
 
     /// Story-global position of the table embed. Used by wasm awareness state
@@ -1779,7 +1818,7 @@ impl EditingDoc {
     #[cfg_attr(not(feature = "wasm"), allow(dead_code))]
     pub(crate) fn table_embed_index(&self, locator: &TableLocator) -> OpResult<u32> {
         let txn = self.yrs_doc().transact();
-        table_at(&txn, locator).map(|(_, _, index)| index)
+        self.cached_table_at(&txn, locator).map(|(_, index)| index)
     }
 
     /// Resolves the table ordinal currently sitting at a sticky story index.
@@ -1791,31 +1830,24 @@ impl EditingDoc {
     ) -> OpResult<TableLocator> {
         let txn = self.yrs_doc().transact();
         let story = story_ref(&txn, story_id).map_err(OpError::from)?;
-        let mut offset = 0u32;
-        let mut ordinal = 0u32;
-        for diff in story.diff(&txn, YChange::identity) {
-            let len = out_len(&diff.insert);
-            if let Out::YMap(map) = diff.insert
-                && map_string(&map, &txn, KIND_KEY).as_deref() == Some("table")
-            {
-                if offset == target_index {
-                    return Ok(TableLocator::new(story_id, ordinal));
-                }
-                ordinal += 1;
-            }
-            offset += len;
+        let embeds = self.table_embeds(story_id, &story, &txn);
+        match embeds
+            .iter()
+            .position(|(offset, _)| *offset == target_index)
+        {
+            Some(ordinal) => Ok(TableLocator::new(story_id, ordinal as u32)),
+            None => Err(OpError::UnknownTable {
+                story: story_id.to_owned(),
+                table_index: embeds.len() as u32,
+            }),
         }
-        Err(OpError::UnknownTable {
-            story: story_id.to_owned(),
-            table_index: ordinal,
-        })
     }
 
     /// Canonicalizes a grid location to the covering cell's anchor and story.
     #[cfg_attr(not(feature = "wasm"), allow(dead_code))]
     pub(crate) fn resolve_cell_identity(&self, loc: &CellLoc) -> OpResult<(CellLoc, String)> {
         let txn = self.yrs_doc().transact();
-        let (_, table, _) = table_at(&txn, &loc.table())?;
+        let (table, _) = self.cached_table_at(&txn, &loc.table())?;
         let data = read_table(&table, &txn)?;
         let (cell_anchors, columns) = anchors(&data)?;
         let row = loc.row as usize;
@@ -1853,7 +1885,7 @@ impl EditingDoc {
         fallback_column: u32,
     ) -> OpResult<CellLoc> {
         let txn = self.yrs_doc().transact();
-        let (_, table, _) = table_at(&txn, locator)?;
+        let (table, _) = self.cached_table_at(&txn, locator)?;
         let data = read_table(&table, &txn)?;
         let (cell_anchors, columns) = anchors(&data)?;
         if let Some(anchor) = cell_anchors

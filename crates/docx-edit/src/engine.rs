@@ -7,7 +7,7 @@ use std::hash::{DefaultHasher, Hasher as _};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use docx_layout::display_list::DisplayList;
+use docx_layout::display_list::{DisplayList, PositionDeltas};
 use docx_layout::endnote_flow::{
     EndnoteFlow, attach_flowed_endnote_areas, flow_column_width, flow_endnotes, flow_target_page,
     flows_with_body, remove_flowed, take_flowed_fragments,
@@ -46,7 +46,9 @@ use yrs::{StickyIndex, Transact};
 
 mod retain;
 
-use retain::{BlockCertificate, BlockSource, SharedBlocks, normalization_contexts, take_block};
+use retain::{
+    BlockCertificate, BlockSource, SharedBlocks, block_identity, normalization_contexts, take_block,
+};
 
 use crate::EditingDoc;
 use crate::bridge::{BridgeError, LoweringMap, RenderEnv, RevisionPreview};
@@ -392,6 +394,12 @@ thread_local! {
     static REGION_FULL_PASSES: Cell<usize> = const { Cell::new(0) };
     /// Table patches applied in place and by copy.
     static TABLE_PATCHES: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    /// Body paragraph patches that numbered the note references again.
+    static BODY_NOTE_RENUMBERS: Cell<u64> = const { Cell::new(0) };
+    /// Arena blocks the plain region pass read note references from.
+    static NOTE_REF_SCANS: Cell<u64> = const { Cell::new(0) };
+    /// Blocks the resident walk captured spacing for anew.
+    static SPACING_CAPTURES: Cell<u64> = const { Cell::new(0) };
     static SHIFT_SAFETY_WORK: Cell<usize> = const { Cell::new(0) };
     static CERTIFIED_FLOAT_WORK: RefCell<(Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>)> = const { RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
     static OPEN_REGION_PATH_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
@@ -535,6 +543,7 @@ impl Drop for MovedArenaGuard<'_> {
             pagination.retain_matches.clear();
             pagination.moved_blocks.clear();
         }
+        pagination.walked_note_refs_absent = false;
     }
 }
 
@@ -2236,6 +2245,14 @@ fn extend_input_for_header_footer(
     }
 }
 
+/// A reused arena, its fingerprints and, when the walk kept them, its spacing
+/// captures.
+type ResidentRegionArena = (
+    Vec<MeasuredBlock>,
+    Vec<Fingerprint>,
+    Option<Vec<BlockSpacing>>,
+);
+
 #[derive(Debug)]
 struct MeasurementPatch {
     base_generation: u64,
@@ -2312,6 +2329,11 @@ struct PaginationState {
     input_lowering: Option<(u64, Rc<LoweringMap>)>,
     retain_matches: Vec<Option<BlockCertificate>>,
     moved_blocks: BTreeSet<usize>,
+    /// The plain region pass that retained `input` found no note reference in it.
+    input_note_refs_absent: bool,
+    /// The reuse walk moved the blocks of an `input` without note references and
+    /// measured no block holding one: the arena it built holds none.
+    walked_note_refs_absent: bool,
     #[cfg(test)]
     retain_match_calls: u64,
     /// The widths, table frames, float geometry and width policy used to measure the arena,
@@ -2351,7 +2373,7 @@ struct PaginationState {
     display_layout_pending: bool,
     display_uses_region_path: bool,
     display_full_rebuild: bool,
-    position_deltas: HashMap<String, i64>,
+    position_deltas: PositionDeltas,
     last_incremental: bool,
     /// Pages whose stamps changed since the last display build, when known.
     restamped_pages: Option<BTreeSet<usize>>,
@@ -2687,6 +2709,8 @@ pub struct EngineSession {
     partial_document: Cell<bool>,
     /// Resident text edits re-lower only their paragraph when eligible.
     local_lowering: Cell<bool>,
+    float_kinds: RefCell<FloatKindsMemo>,
+    moved_keys: RefCell<MovedKeys>,
     /// Body heading levels by paragraph id, for the document version they were read at.
     /// The body's headings, by the document version and body revision they were read at.
     page_text_headings: RefCell<Option<(PageTextHeadingsRead, Rc<HashMap<String, u8>>)>>,
@@ -2992,6 +3016,35 @@ fn resident_paragraph_position(input: &LayoutInput, para_id: &str, offset: u32) 
         let (id, start) = paragraph_identity(&measured.block)?;
         (block_key(id) == para_id).then_some(start?)
     })?;
+    paragraph_offset_position(start, offset)
+}
+
+/// [`resident_paragraph_position`] for a paragraph of a table cell, nested tables included: the
+/// first block lowered from `para_id`, under the same plain-runs rule.
+fn resident_cell_paragraph_position(
+    input: &LayoutInput,
+    para_id: &str,
+    offset: u32,
+) -> Option<i64> {
+    fn start_of(block: &LayoutBlock, para_id: &str) -> Option<Option<f64>> {
+        match block {
+            LayoutBlock::Table(table) => table
+                .rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .flat_map(|cell| &cell.blocks)
+                .find_map(|nested| start_of(nested, para_id)),
+            LayoutBlock::Paragraph(paragraph) if block_key(&paragraph.id) == para_id => {
+                Some(paragraph_identity(block).and_then(|(_, start)| start))
+            }
+            _ => None,
+        }
+    }
+    let start = input
+        .measured
+        .iter()
+        .filter(|measured| matches!(measured.block, LayoutBlock::Table(_)))
+        .find_map(|measured| start_of(&measured.block, para_id))??;
     paragraph_offset_position(start, offset)
 }
 
@@ -3476,11 +3529,12 @@ fn contextual_spacing_enabled(paragraph: &docx_layout::types::ParagraphBlock) ->
         .is_some_and(|attrs| attrs.contextual_spacing.unwrap_or(false))
 }
 
-#[derive(Clone, Debug)]
+/// Shared, so the reuse walk keeps a moved table's capture by reference.
+#[derive(Clone, Debug, PartialEq)]
 enum BlockSpacing {
     None,
     Paragraph(Option<u64>, Option<u64>),
-    Table(Vec<Self>),
+    Table(Rc<[Self]>),
 }
 
 impl BlockSpacing {
@@ -3543,7 +3597,7 @@ impl BlockSpacing {
                 if entries.iter().all(|entry| matches!(entry, Self::None)) {
                     Self::None
                 } else {
-                    Self::Table(entries)
+                    Self::Table(entries.into())
                 }
             }
             _ => Self::None,
@@ -4390,29 +4444,85 @@ fn certify_retained_blocks(
         .collect()
 }
 
+/// The float kinds of the floating tables, by what classified them. Classifying
+/// a floating table measures it, and typing elsewhere leaves it the same table.
+#[derive(Default)]
+struct FloatKindsMemo {
+    /// The content width, width policy, measurement and page geometry they were
+    /// classified under.
+    config: Option<Fingerprint>,
+    /// Kinds by the table's position-free fingerprint and its width.
+    tables: HashMap<(Fingerprint, u64), (bool, bool)>,
+}
+
 fn resident_float_kinds(
     blocks: &SharedBlocks,
     widths: &[f64],
     float_width_policy: FloatWidthPolicy,
     measurement: &docx_layout::measure_blocks::MeasurementConfig,
     geometry: &docx_layout::measure_blocks::FloatPageGeometry,
-) -> Result<(bool, bool), String> {
+    memo: &RefCell<FloatKindsMemo>,
+) -> Result<(bool, bool, Vec<bool>), String> {
     let mut kinds = (false, false);
+    let mut zones = Vec::with_capacity(blocks.len());
     let default_width = widths.first().copied().unwrap_or(0.0);
+    let config = crate::fingerprint::fingerprint_without_positions(&(
+        default_width,
+        format!("{float_width_policy:?}"),
+        measurement,
+        float_geometry_key(geometry),
+        docx_layout::measure_fonts_generation(),
+    ))?;
+    let mut memo = memo.borrow_mut();
+    let mut previous = if memo.config == Some(config) {
+        std::mem::take(&mut memo.tables)
+    } else {
+        HashMap::new()
+    };
+    let mut tables = HashMap::new();
     for (index, block) in blocks.iter().enumerate() {
         let width = widths.get(index).copied().unwrap_or(default_width);
-        let next = docx_layout::measure_blocks::floating_zone_kinds_with_width_policy(
-            std::slice::from_ref(block),
-            default_width,
-            &[width],
-            float_width_policy,
-            measurement,
-            Some(geometry),
-        )?;
+        let classify = || {
+            docx_layout::measure_blocks::floating_zone_kinds_with_width_policy(
+                std::slice::from_ref(block),
+                default_width,
+                &[width],
+                float_width_policy,
+                measurement,
+                Some(geometry),
+            )
+        };
+        let next = match block {
+            LayoutBlock::Table(table) if table.floating.is_some() => {
+                let key = (
+                    crate::fingerprint::fingerprint_without_positions(block)?,
+                    width.to_bits(),
+                );
+                let next = match previous.remove(&key) {
+                    Some(next) => next,
+                    None => {
+                        #[cfg(test)]
+                        FLOAT_TABLE_CLASSIFICATIONS.with(|count| count.set(count.get() + 1));
+                        classify()?
+                    }
+                };
+                tables.insert(key, next);
+                next
+            }
+            _ => classify()?,
+        };
         kinds.0 |= next.0;
         kinds.1 |= next.1;
+        zones.push(next.0);
     }
-    Ok(kinds)
+    memo.config = Some(config);
+    memo.tables = tables;
+    Ok((kinds.0, kinds.1, zones))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FLOAT_TABLE_CLASSIFICATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Whether `block` is, or nests, one of `paragraphs`.
@@ -4475,35 +4585,108 @@ fn nested_block_keys(block: &LayoutBlock, out: &mut Vec<String>) {
     }
 }
 
-fn position_deltas(previous: &LayoutInput, next: &LayoutInput) -> HashMap<String, i64> {
-    previous
-        .measured
-        .iter()
-        .zip(&next.measured)
-        .filter_map(|(previous, next)| {
-            let previous_id = previous.block.block_id()?;
-            let next_id = next.block.block_id()?;
-            let key = block_key(previous_id);
-            if key != block_key(next_id) {
-                return None;
+/// The keys of the blocks that moved alike from `from` on, with the blocks'
+/// fingerprints they were read at. Keystrokes in one paragraph move the same
+/// blocks, so the next keystroke shares the keys instead of reading them again.
+#[derive(Default)]
+struct MovedKeys {
+    from: usize,
+    moved: Vec<bool>,
+    fingerprints: Vec<Fingerprint>,
+    keys: Arc<HashSet<String>>,
+}
+
+/// The key `next` keeps from `previous`, and how far it moved, when it moved.
+fn moved_block<'a>(
+    previous: &MeasuredBlock,
+    next: &'a MeasuredBlock,
+) -> Option<(Cow<'a, str>, i64)> {
+    let previous_id = previous.block.block_id()?;
+    let next_id = next.block.block_id()?;
+    let key = block_key(next_id);
+    if key != block_key(previous_id) {
+        return None;
+    }
+    let delta = next.block.pm_start()? as i64 - previous.block.pm_start()? as i64;
+    (delta != 0).then_some((key, delta))
+}
+
+/// How far each block of `next_input` moved from `previous_input`, by key.
+/// With `moved_keys`, blocks that all moved alike share the keys read for the
+/// last edit while `next_fingerprints` still hold for them.
+fn position_deltas(
+    previous_input: &LayoutInput,
+    next_input: &LayoutInput,
+    next_fingerprints: Option<&[Fingerprint]>,
+    moved_keys: Option<&RefCell<MovedKeys>>,
+) -> PositionDeltas {
+    let blocks = || previous_input.measured.iter().zip(&next_input.measured);
+    let mut shared = None;
+    let mut moved = Vec::new();
+    for (index, (previous, next)) in blocks().enumerate() {
+        let delta = moved_block(previous, next).map(|(_, delta)| delta);
+        match (shared, delta) {
+            (None, None) => {}
+            (None, Some(delta)) => {
+                shared = Some((index, delta));
+                moved.reserve(next_input.measured.len() - index);
+                moved.push(true);
             }
-            let previous_start = previous.block.pm_start();
-            let next_start = next.block.pm_start();
-            let delta = next_start? as i64 - previous_start? as i64;
-            if delta == 0 {
-                return None;
+            (Some((_, alike)), delta) => {
+                if delta.is_some_and(|delta| delta != alike) {
+                    shared = None;
+                    break;
+                }
+                moved.push(delta.is_some());
             }
-            let mut entries = vec![(key.into_owned(), delta)];
-            // Nested paragraphs (table cells, text boxes, shape text) carry
-            // their own ids on display primitives but shift with the
-            // enclosing block.
+        }
+    }
+    if let (Some((from, delta)), Some(fingerprints), Some(memo)) =
+        (shared, next_fingerprints, moved_keys)
+        && fingerprints.len() == next_input.measured.len()
+    {
+        let mut memo = memo.borrow_mut();
+        if memo.from != from || memo.moved != moved || memo.fingerprints != fingerprints[from..] {
+            let mut keys = HashSet::new();
             let mut nested = Vec::new();
-            nested_block_keys(&next.block, &mut nested);
-            entries.extend(nested.into_iter().map(|key| (key, delta)));
-            Some(entries)
-        })
-        .flatten()
-        .collect()
+            for ((previous, next), _) in
+                blocks().skip(from).zip(&moved).filter(|(_, moved)| **moved)
+            {
+                let (key, _) = moved_block(previous, next).expect("a moved block has a delta");
+                keys.insert(key.into_owned());
+                nested_block_keys(&next.block, &mut nested);
+                keys.extend(nested.drain(..));
+            }
+            #[cfg(test)]
+            MOVED_KEY_READS.with(|reads| reads.set(reads.get() + 1));
+            *memo = MovedKeys {
+                from,
+                moved,
+                fingerprints: fingerprints[from..].to_vec(),
+                keys: Arc::new(keys),
+            };
+        }
+        return PositionDeltas::shared(Arc::clone(&memo.keys), delta);
+    }
+    let mut deltas = HashMap::new();
+    let mut nested = Vec::new();
+    for (previous, next) in blocks() {
+        let Some((key, delta)) = moved_block(previous, next) else {
+            continue;
+        };
+        deltas.insert(key.into_owned(), delta);
+        // Nested paragraphs (table cells, text boxes, shape text) carry
+        // their own ids on display primitives but shift with the
+        // enclosing block.
+        nested_block_keys(&next.block, &mut nested);
+        deltas.extend(nested.drain(..).map(|key| (key, delta)));
+    }
+    PositionDeltas::from_keys(deltas)
+}
+
+#[cfg(test)]
+thread_local! {
+    static MOVED_KEY_READS: Cell<usize> = const { Cell::new(0) };
 }
 
 fn incremental_eligible_plain(
@@ -5311,6 +5494,8 @@ impl EngineSession {
             font_fingerprints: RefCell::new(HashMap::new()),
             partial_document: Cell::new(false),
             local_lowering: Cell::new(false),
+            float_kinds: RefCell::default(),
+            moved_keys: RefCell::default(),
             page_text_headings: RefCell::new(None),
             #[cfg(test)]
             preview_refresh: Cell::new(true),
@@ -6056,10 +6241,20 @@ impl EngineSession {
                 lowered
                     .local
                     .patch(blocks.shared_mut(), map, revealable, &txn, env, &edit)?;
-            let renumbered = docx_layout::footnotes::number_note_references(
-                blocks.shared_mut().as_mut_slice(),
-                &env.note_numbering,
-            );
+            // Without note references in the paragraph before or after the edit,
+            // and with its section end unchanged, numbering labels nothing anew.
+            let patched = blocks.shared().get(slot)?;
+            let notes = !collect_note_refs(std::slice::from_ref(old_block.as_ref())).is_empty()
+                || !collect_note_refs(std::slice::from_ref(patched.as_ref())).is_empty()
+                || advances_region_section(old_block.as_ref())
+                    != advances_region_section(patched.as_ref());
+            #[cfg(test)]
+            BODY_NOTE_RENUMBERS.with(|count| count.set(count.get() + u64::from(notes)));
+            let renumbered = notes
+                && docx_layout::footnotes::number_note_references(
+                    blocks.shared_mut().as_mut_slice(),
+                    &env.note_numbering,
+                );
             Some((shift, renumbered))
         })();
         let Some((shift, renumbered)) = shift else {
@@ -8111,8 +8306,7 @@ impl EngineSession {
                     &mut || {},
                     |blocks, lowering| -> Result<Arena, String> {
                         input_lowering = Some(lowering);
-                        measured_spacing =
-                            BlockSpacing::capture_blocks(blocks.iter(), Some(&regions));
+                        let capture = || BlockSpacing::capture_blocks(blocks.iter(), Some(&regions));
                         apply_section_geometry(&mut input, &regions);
                         let (widths, mut table_wrap_frames) =
                             region_table_measurement_frames(blocks.iter(), &input, &regions);
@@ -8128,16 +8322,18 @@ impl EngineSession {
                         measured_table_wrap_frames.clone_from(&table_wrap_frames);
                         measured_float_geometry = Some(float_geometry_key(&geometry));
                         float_width_policy = FloatWidthPolicy::for_document(blocks.iter());
-                        let (floats, margin_floats) = resident_float_kinds(
+                        let (floats, margin_floats, zone_blocks) = resident_float_kinds(
                             blocks,
                             &widths,
                             float_width_policy,
                             &measurement,
                             &geometry,
+                            &self.float_kinds,
                         )?;
                         has_floats = floats;
                         // margin-relative zones couple the whole flow; re-measure all
                         if margin_floats || (floats && blocks.iter().any(|block| matches!(block, LayoutBlock::Shape(shape) if wraps_by_page_side(shape)))) {
+                            measured_spacing = capture();
                             return Ok(Arena::Full(blocks.to_vec(), true));
                         }
                         match self.resident_region_measured(
@@ -8154,12 +8350,19 @@ impl EngineSession {
                             &measurement,
                             measurement_fingerprint,
                             floats.then_some(&geometry),
+                            Some(&zone_blocks),
                             trigger,
                         )? {
-                            Some((measured, fingerprints)) => {
+                            Some((measured, fingerprints, spacing)) => {
+                                measured_spacing = spacing.unwrap_or_else(capture);
+                                #[cfg(test)]
+                                assert_eq!(measured_spacing, capture(), "reused spacing");
                                 Ok(Arena::Reused(measured, fingerprints))
                             }
-                            None => Ok(Arena::Full(blocks.to_vec(), false)),
+                            None => {
+                                measured_spacing = capture();
+                                Ok(Arena::Full(blocks.to_vec(), false))
+                            }
                         }
                     },
                 )
@@ -8545,11 +8748,26 @@ impl EngineSession {
         // body. Without notes, this pass's own pagination is such a placement: the
         // pictures are checked against it, and settled and paginated again only when
         // one lands in another frame than it measured in, which typing rarely makes.
-        let only_pictures = resident_body
-            && wraps_only_continuous_pictures(&input, &regions)
-            && input.measured.iter().all(|measured| {
-                collect_note_refs(std::slice::from_ref(&measured.block)).is_empty()
-            });
+        // Settling and flow wrapping measure the blocks again but keep their runs,
+        // so the note references read here are the final pass's.
+        let walked_without_refs = {
+            let pagination = self.pagination.borrow();
+            pagination.walked_note_refs_absent && !pagination.moved_blocks.is_empty()
+        };
+        let refs = if walked_without_refs {
+            Vec::new()
+        } else {
+            #[cfg(test)]
+            NOTE_REF_SCANS.with(|scans| scans.set(scans.get() + input.measured.len() as u64));
+            input
+                .measured
+                .iter()
+                .flat_map(|measured| collect_note_refs(std::slice::from_ref(&measured.block)))
+                .collect::<Vec<_>>()
+        };
+        let note_refs_absent = refs.is_empty();
+        let only_pictures =
+            resident_body && refs.is_empty() && wraps_only_continuous_pictures(&input, &regions);
         let settle_pictures = (only_pictures && self.pictures_settled.get()).then(|| {
             let spacing =
                 PlacementSpacing::record(input.measured.iter().map(|measured| &measured.block));
@@ -8563,8 +8781,14 @@ impl EngineSession {
                 &mut frames,
                 &pictures,
             );
-            // as the settling placement would leave the blocks
-            docx_layout::paragraph_spacing::apply_contextual_spacing_measured(&mut input.measured);
+            // as the settling placement would leave the blocks; placement applies
+            // it first thing, so only fingerprints taken from this arena below
+            // read the blocks before it
+            if block_fingerprints.is_none() {
+                docx_layout::paragraph_spacing::apply_contextual_spacing_measured(
+                    &mut input.measured,
+                );
+            }
             (spacing, frames)
         });
         if resident_body && settle_pictures.is_none() {
@@ -8594,11 +8818,6 @@ impl EngineSession {
             }
             None => measured_fingerprints(&input)?,
         };
-        let refs = input
-            .measured
-            .iter()
-            .flat_map(|measured| collect_note_refs(std::slice::from_ref(&measured.block)))
-            .collect::<Vec<_>>();
         let previous_notes = note_page_keys_plain(self.pagination.borrow().layout.as_ref());
         // The note fixpoint replays `base_input`. Without notes `input` is the
         // final pass; with notes the final pass carries reserved heights, so
@@ -8928,6 +9147,8 @@ impl EngineSession {
         pagination.measured_float_width_policy =
             pagination.measured_with.map(|_| float_width_policy);
         pagination.measured_with_floats = has_floats;
+        pagination.input_note_refs_absent = note_refs_absent && pagination.input.is_some();
+        pagination.walked_note_refs_absent = false;
         // Checkpoints of a prefix pass describe a cut document.
         if provisional {
             pagination.checkpoints.clear();
@@ -9308,7 +9529,7 @@ impl EngineSession {
                     .borrow()
                     .input
                     .as_ref()
-                    .map(|previous| position_deltas(previous, &final_input))
+                    .map(|previous| position_deltas(previous, &final_input, None, None))
                     .unwrap_or_default();
                 if let Some(pass) = pass {
                     let input_options_fingerprint = options_fingerprint(&final_input)?;
@@ -10359,7 +10580,7 @@ impl EngineSession {
             .as_ref()
             .map(|layout| layout.pages.len());
         let mut incremental = false;
-        let mut deltas = HashMap::new();
+        let mut deltas = PositionDeltas::default();
         let run = {
             let mut previous = self.pagination.borrow_mut();
             self.prepare_placement_fingerprints(
@@ -10417,6 +10638,8 @@ impl EngineSession {
                 deltas = position_deltas(
                     previous.input.as_ref().expect("eligibility checked input"),
                     &input,
+                    Some(&block_fingerprints),
+                    Some(&self.moved_keys),
                 );
                 let attempted = docx_layout::place::layout_document_incremental_ranges(
                     &mut input,
@@ -10463,7 +10686,7 @@ impl EngineSession {
         revision_preview: Option<(u64, &BTreeMap<String, RevisionPreview>, bool)>,
         cached_page_totals: bool,
         run: docx_layout::place::IncrementalLayout,
-        (incremental, deltas, previous_page_count): (bool, HashMap<String, i64>, Option<usize>),
+        (incremental, deltas, previous_page_count): (bool, PositionDeltas, Option<usize>),
         input_options_fingerprint: u64,
         trigger: RelayoutTrigger,
     ) -> Result<(), String> {
@@ -10480,9 +10703,11 @@ impl EngineSession {
         } = run;
         let mut pagination = self.pagination.borrow_mut();
         pagination.input = Some(input);
+        pagination.input_note_refs_absent = false;
         pagination.flowed_tail = None;
         pagination.measured_spacing = measured_spacing;
         pagination.moved_blocks.clear();
+        pagination.walked_note_refs_absent = false;
         if trigger.uses_region_path() {
             pagination.retain_matches.clear();
         }
@@ -10527,15 +10752,8 @@ impl EngineSession {
                             .extend(state.rebuilt_page_ranges.iter().flat_map(Clone::clone));
                     }
                 }
-                for (key, delta) in deltas {
-                    let pending = state.position_deltas.entry(key).or_default();
-                    match pending.checked_add(delta) {
-                        Some(delta) => *pending = delta,
-                        None => {
-                            state.display_full_rebuild = true;
-                            break;
-                        }
-                    }
+                if !state.position_deltas.add(deltas) {
+                    state.display_full_rebuild = true;
                 }
             }
             pagination.limit_display_damage();
@@ -10863,8 +11081,9 @@ impl EngineSession {
         measurement: &docx_layout::measure_blocks::MeasurementConfig,
         measurement_fingerprint: u64,
         floats: Option<&docx_layout::measure_blocks::FloatPageGeometry>,
+        zone_blocks: Option<&[bool]>,
         trigger: RelayoutTrigger,
-    ) -> Result<Option<(Vec<MeasuredBlock>, Vec<Fingerprint>)>, String> {
+    ) -> Result<Option<ResidentRegionArena>, String> {
         if !trigger.uses_region_path() {
             return self.resident_region_measured_plain(
                 blocks,
@@ -10876,6 +11095,7 @@ impl EngineSession {
                 measurement,
                 measurement_fingerprint,
                 floats,
+                zone_blocks,
             );
         }
         let measurement_patch = self.measurement_patch().take();
@@ -10934,8 +11154,10 @@ impl EngineSession {
         let font_chains_unchanged =
             pagination.measured_font_chains.as_ref() == Some(&measurement.font_chains);
         let mut dependencies = pagination.measured_font_dependencies.clone();
-        let mut candidates = Vec::with_capacity(blocks.len());
-        let mut fingerprint_blocks = vec![None; blocks.len()];
+        // A paragraph block is over a kilobyte, so the per-block slots hold boxes:
+        // most blocks of an edit are shifted in place and fill no slot.
+        let mut candidates: Vec<Option<Box<MeasuredBlock>>> = Vec::with_capacity(blocks.len());
+        let mut fingerprint_blocks: Vec<Option<Box<LayoutBlock>>> = vec![None; blocks.len()];
         let mut reused = vec![false; blocks.len()];
         let mut certificates = vec![None; blocks.len()];
         let mut float_dirty = vec![false; blocks.len()];
@@ -10994,23 +11216,27 @@ impl EngineSession {
                         _ => lowered.get(index) == Some(next_block),
                     }
                 });
+            // The patch certifies a block as the last pass's shifted, under the
+            // same request, so its spacing still matches its capture.
+            let certified = measurement_patch
+                .as_ref()
+                .is_some_and(|patch| patch.certifies_block(blocks, index));
             let width_clean = self.font_dependency_matches(
                 &dependencies[index],
                 &measurement.font_chains,
                 font_chains_unchanged,
             ) && section_break_mark == retained_section_break_mark
-                && pagination.measured_spacing[index].matches(
-                    next_block,
-                    Some(regions.paragraph_spacing_line_px(section_index)),
-                )
+                && (certified
+                    || pagination.measured_spacing[index].matches(
+                        next_block,
+                        Some(regions.paragraph_spacing_line_px(section_index)),
+                    ))
                 && widths.get(index) == previous_widths.get(index)
                 && matches!(previous_entry.measure, BlockExtent::Unsupported)
                     == matches!(next_block, LayoutBlock::Unsupported)
                 && raw_clean;
             let certified_shift = width_clean
-                && measurement_patch
-                    .as_ref()
-                    .is_some_and(|patch| patch.certifies_block(blocks, index))
+                && certified
                 && *pagination.measured_shift_safe[index]
                     .get_or_insert_with(|| measurement_shift_safe(&previous_entry.block));
             if certified_shift {
@@ -11057,10 +11283,10 @@ impl EngineSession {
                 reused[index] = true;
                 certificates[index] = certificate.cloned();
             } else if width_clean && measurement_patch.is_none() && *next_block == *previous_block {
-                candidates.push(Some(MeasuredBlock {
+                candidates.push(Some(Box::new(MeasuredBlock {
                     block: next_block.clone(),
                     measure: BlockExtent::Unsupported,
-                }));
+                })));
                 reused[index] = true;
             } else {
                 #[cfg(test)]
@@ -11068,7 +11294,7 @@ impl EngineSession {
                     CERTIFIED_FLOAT_WORK.with(|work| work.borrow_mut().1.push(index));
                 }
                 let mut owned = normalize_measurement_block(next_block, regions, section_index);
-                fingerprint_blocks[index] = Some(owned.clone());
+                fingerprint_blocks[index] = Some(Box::new(owned.clone()));
                 suppress_contextual_spacing(blocks, index, &mut owned);
                 docx_layout::paragraph_spacing::apply_contextual_spacing_blocks(
                     std::slice::from_mut(&mut owned),
@@ -11091,17 +11317,17 @@ impl EngineSession {
                     if shape_equal && measurement_patch.is_some() {
                         retain_shape_measurements(&mut owned, previous_block);
                     }
-                    candidates.push(Some(MeasuredBlock {
+                    candidates.push(Some(Box::new(MeasuredBlock {
                         block: owned,
                         measure: BlockExtent::Unsupported,
-                    }));
+                    })));
                     reused[index] = true;
                 } else if floats.is_some() {
                     float_dirty[index] = true;
-                    candidates.push(Some(MeasuredBlock {
+                    candidates.push(Some(Box::new(MeasuredBlock {
                         block: owned,
                         measure: BlockExtent::Unsupported,
-                    }));
+                    })));
                 } else {
                     let measurement_block = fingerprint_blocks[index]
                         .as_mut()
@@ -11122,10 +11348,10 @@ impl EngineSession {
                     });
                     dependencies[index] = reads;
                     retain_shape_measurements(&mut owned, measurement_block);
-                    candidates.push(Some(MeasuredBlock {
+                    candidates.push(Some(Box::new(MeasuredBlock {
                         block: owned,
                         measure: measure?,
-                    }));
+                    })));
                     measure_calls = measure_calls.wrapping_add(1);
                     #[cfg(test)]
                     BODY_MEASUREMENT_WORK.with(|work| work.borrow_mut().0.push(index));
@@ -11146,7 +11372,51 @@ impl EngineSession {
                         )
                     })
                     .unwrap_or(blocks.len());
-                if float_dirty[start..end].contains(&true) {
+                // A segment that anchors no float measures each block as a body
+                // without floats does, so only its dirty paragraphs are measured
+                // again, and the rest keep their extents.
+                let anchors_none = || {
+                    zone_blocks.is_some_and(|zones| {
+                        zones.len() == blocks.len() && !zones[start..end].contains(&true)
+                    }) && (start..end).all(|index| {
+                        let block = blocks.get(index).expect("body block");
+                        !anchors_objects(std::slice::from_ref(block))
+                            && (!float_dirty[index] || matches!(block, LayoutBlock::Paragraph(_)))
+                    })
+                };
+                if float_dirty[start..end].contains(&true) && anchors_none() {
+                    for index in (start..end).filter(|&index| float_dirty[index]) {
+                        let measurement_block = fingerprint_blocks[index]
+                            .as_mut()
+                            .expect("unsuppressed dirty block");
+                        let (measure, reads) = FontChainDependencies::capture(|| {
+                            if marks[index] {
+                                Ok(BlockExtent::Paragraph(ParagraphExtent {
+                                    lines: Vec::new(),
+                                    total_height: 0.0,
+                                }))
+                            } else {
+                                docx_layout::measure_blocks::measure_block(
+                                    measurement_block,
+                                    widths.get(index).copied().unwrap_or(default_width),
+                                    measurement,
+                                )
+                            }
+                        });
+                        dependencies[index] = reads;
+                        let entry = candidates[index].as_mut().expect("dirty block");
+                        retain_shape_measurements(&mut entry.block, measurement_block);
+                        entry.measure = measure?;
+                        measure_calls = measure_calls.wrapping_add(1);
+                        #[cfg(test)]
+                        {
+                            if measurement_patch.is_some() {
+                                CERTIFIED_FLOAT_WORK.with(|work| work.borrow_mut().1.push(index));
+                            }
+                            BODY_MEASUREMENT_WORK.with(|work| work.borrow_mut().0.push(index));
+                        }
+                    }
+                } else if float_dirty[start..end].contains(&true) {
                     let mut segment: Vec<_> = (start..end)
                         .map(|index| {
                             #[cfg(test)]
@@ -11178,12 +11448,12 @@ impl EngineSession {
                         segment.into_iter().zip(extents).enumerate()
                     {
                         let index = start + offset;
-                        fingerprint_blocks[index] = Some(block.clone());
+                        fingerprint_blocks[index] = Some(Box::new(block.clone()));
                         suppress_contextual_spacing(blocks, index, &mut block);
                         docx_layout::paragraph_spacing::apply_contextual_spacing_blocks(
                             std::slice::from_mut(&mut block),
                         );
-                        candidates[index] = Some(MeasuredBlock { block, measure });
+                        candidates[index] = Some(Box::new(MeasuredBlock { block, measure }));
                         dependencies[index] = reads[offset].clone();
                         reused[index] = false;
                         if let Some(shifted) = shifted_reuse.get_mut(index) {
@@ -11214,7 +11484,7 @@ impl EngineSession {
                     let entry = entry.as_ref().expect("normalized retained block");
                     let mut block = fingerprint_blocks[index]
                         .take()
-                        .unwrap_or_else(|| entry.block.clone());
+                        .map_or_else(|| entry.block.clone(), |block| *block);
                     retain_shape_measurements(&mut block, &entry.block);
                     measured_parts_fingerprint(&block, &previous.measured[index].measure)
                 } else if reused[index] {
@@ -11225,7 +11495,7 @@ impl EngineSession {
                         CERTIFIED_FLOAT_WORK.with(|work| work.borrow_mut().3.push(index));
                     }
                     let entry = entry.as_ref().expect("measured dirty block");
-                    let mut block = fingerprint_blocks[index]
+                    let mut block = *fingerprint_blocks[index]
                         .take()
                         .expect("unsuppressed dirty block");
                     retain_shape_measurements(&mut block, &entry.block);
@@ -11233,7 +11503,17 @@ impl EngineSession {
                 }
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let mut measured = Vec::with_capacity(blocks.len());
+        // The new arena takes over the old one's storage, so a moved block is
+        // shifted where it lies. The old arena keeps what pagination reads of a
+        // moved block, its identity and start position, and the rest of the
+        // blocks it held.
+        let mut measured = std::mem::take(&mut previous.measured);
+        let mut retained = Vec::with_capacity(measured.len());
+        let mut moved_blocks = Vec::new();
+        // A moved block keeps its spacing capture, which matched it above. The
+        // retained captures stay for the flowed tail the pass may restore.
+        let mut spacing = pagination.measured_spacing.clone();
+        let mut note_refs_absent = pagination.input_note_refs_absent;
         for (index, candidate) in candidates.into_iter().enumerate() {
             if shifted_reuse.get(index) != Some(&true)
                 && (!reused[index] || candidate.is_some())
@@ -11241,30 +11521,50 @@ impl EngineSession {
             {
                 *safe = None;
             }
-            let previous_entry = &mut previous.measured[index];
-            let mut entry = match candidate {
-                Some(entry) => entry,
+            let entry = &mut measured[index];
+            let mut old = match candidate {
+                Some(candidate) => {
+                    note_refs_absent = note_refs_absent
+                        && collect_note_refs(std::slice::from_ref(&candidate.block)).is_empty();
+                    spacing[index] = BlockSpacing::capture(
+                        blocks.get(index).expect("body block"),
+                        Some(regions.paragraph_spacing_line_px(sections[index])),
+                    );
+                    #[cfg(test)]
+                    SPACING_CAPTURES.with(|captures| captures.set(captures.get() + 1));
+                    std::mem::replace(entry, *candidate)
+                }
                 None => {
-                    pagination.moved_blocks.insert(index);
+                    debug_assert!(reused[index], "an unfilled slot is reused");
+                    moved_blocks.push(index);
+                    // read before the shift: pagination takes the move from it
+                    let identity = block_identity(&entry.block);
+                    if shifted_reuse.get(index) == Some(&true)
+                        && let Some(patch) = &measurement_patch
+                        && index >= patch.replaced.end
+                        && patch.shift.delta != 0
+                    {
+                        crate::bridge::local::shift_block(&mut entry.block, patch.shift.delta);
+                    }
                     MeasuredBlock {
-                        block: take_block(&mut previous_entry.block),
-                        measure: BlockExtent::Unsupported,
+                        block: identity,
+                        measure: std::mem::replace(&mut entry.measure, BlockExtent::Unsupported),
                     }
                 }
             };
             if reused[index] {
-                if shifted_reuse.get(index) == Some(&true)
-                    && let Some(patch) = &measurement_patch
-                    && index >= patch.replaced.end
-                    && patch.shift.delta != 0
-                {
-                    crate::bridge::local::shift_block(&mut entry.block, patch.shift.delta);
-                }
                 pagination.measurement_patch = None;
-                entry.measure =
-                    std::mem::replace(&mut previous_entry.measure, BlockExtent::Unsupported);
+                entry.measure = std::mem::replace(&mut old.measure, BlockExtent::Unsupported);
             }
-            measured.push(entry);
+            retained.push(old);
+        }
+        previous.measured = retained;
+        pagination.walked_note_refs_absent = note_refs_absent && !moved_blocks.is_empty();
+        // in index order, so an empty set is built in bulk
+        if pagination.moved_blocks.is_empty() {
+            pagination.moved_blocks = moved_blocks.into_iter().collect();
+        } else {
+            pagination.moved_blocks.extend(moved_blocks);
         }
         #[cfg(test)]
         {
@@ -11290,7 +11590,7 @@ impl EngineSession {
         if measurement_patch.is_some() {
             self.certified_measurement_epoch.set(Some(self.doc_epoch()));
         }
-        Ok(Some((measured, block_fingerprints)))
+        Ok(Some((measured, block_fingerprints, Some(spacing))))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11305,7 +11605,8 @@ impl EngineSession {
         measurement: &docx_layout::measure_blocks::MeasurementConfig,
         measurement_fingerprint: u64,
         floats: Option<&docx_layout::measure_blocks::FloatPageGeometry>,
-    ) -> Result<Option<(Vec<MeasuredBlock>, Vec<Fingerprint>)>, String> {
+        zone_blocks: Option<&[bool]>,
+    ) -> Result<Option<ResidentRegionArena>, String> {
         let edited = self.pagination.borrow().doc_epoch != self.doc_epoch();
         if floats.is_some() && (self.measurement_patch().is_some() || !edited) {
             #[cfg(test)]
@@ -11324,6 +11625,7 @@ impl EngineSession {
                 measurement,
                 measurement_fingerprint,
                 floats,
+                zone_blocks,
                 RelayoutTrigger::Bulk,
             );
         }
@@ -11684,7 +11986,7 @@ impl EngineSession {
         measurement_state.resident_reused_blocks = measurement_state
             .resident_reused_blocks
             .wrapping_add(reused_blocks);
-        Ok(Some((measured, block_fingerprints)))
+        Ok(Some((measured, block_fingerprints, None)))
     }
 
     /// Complete the post-edit dependency cone and return its binary frame.
@@ -11904,6 +12206,7 @@ impl EngineSession {
                             float_width_policy,
                             measurement.as_ref(),
                             &geometry,
+                            &self.float_kinds,
                         )?
                         .0
                     {
@@ -12731,7 +13034,9 @@ impl EngineSession {
     ) -> Result<ResidentCaretSnapshot, String> {
         let position = paragraph.and_then(|(para_id, offset)| {
             let pagination = self.pagination.borrow();
-            resident_paragraph_position(pagination.input.as_ref()?, para_id, offset)
+            let input = pagination.input.as_ref()?;
+            resident_paragraph_position(input, para_id, offset)
+                .or_else(|| resident_cell_paragraph_position(input, para_id, offset))
         });
         let display = self.display.borrow();
         let frame_epoch = display.binary_frame_epoch;
@@ -18724,7 +19029,7 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
             pagination.measured_widths = vec![300.0];
             pagination.set_font_dependencies(vec![dependencies.clone()], None);
         }
-        let (reused, fingerprints) = engine
+        let (reused, fingerprints, spacing) = engine
             .resident_region_measured(
                 &blocks,
                 None,
@@ -18735,6 +19040,7 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
                 &prepared.measurement,
                 prepared.measurement_fingerprint,
                 None,
+                None,
                 RelayoutTrigger::Preview,
             )
             .unwrap()
@@ -18743,6 +19049,7 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
             let mut pagination = engine.pagination.borrow_mut();
             pagination.input.as_mut().unwrap().measured = reused;
             pagination.block_fingerprints = fingerprints;
+            pagination.measured_spacing = spacing.unwrap();
         }
         let font = include_bytes!("../../ooxml-text/tests/fonts/LiberationSans-Regular.ttf");
         assert_eq!(docx_layout::register_measure_font_bytes(font).unwrap(), 0);
@@ -18762,6 +19069,7 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
                     &prepared.regions,
                     &prepared.measurement,
                     prepared.measurement_fingerprint,
+                    None,
                     None,
                     RelayoutTrigger::Preview,
                 )
@@ -19048,7 +19356,7 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
                 "kind": if previous_is_section {"pageBreak"} else {"sectionBreak"}, "id": "previous"
             }))
             .unwrap();
-            let (warm, _) = engine
+            let (warm, _, _) = engine
                 .resident_region_measured(
                     &blocks,
                     None,
@@ -19058,6 +19366,7 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
                     &prepared.regions,
                     &prepared.measurement,
                     prepared.measurement_fingerprint,
+                    None,
                     None,
                     RelayoutTrigger::Preview,
                 )
@@ -20991,6 +21300,8 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
         certified_float_segment(engine, replaced)
     }
 
+    /// The blocks a float-aware edit of `replaced` measures again: the float
+    /// segment holding it, or only `replaced` when that segment anchors no float.
     fn certified_float_segment(
         engine: &EngineSession,
         replaced: std::ops::Range<usize>,
@@ -21008,7 +21319,13 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
                 docx_layout::measure_blocks::resets_float_flow(blocks.get(index).unwrap())
             })
             .unwrap_or(blocks.len());
-        (start..end).collect()
+        if (start..end)
+            .any(|index| anchors_objects(std::slice::from_ref(blocks.get(index).unwrap())))
+        {
+            (start..end).collect()
+        } else {
+            replaced.collect()
+        }
     }
 
     #[test]
@@ -21353,6 +21670,370 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
                 );
                 assert_certified_float_cold(&engine, &request, &mut retained);
             }
+        }
+    }
+
+    #[test]
+    fn typing_before_floating_tables_classifies_them_once() {
+        let fonts = docx_layout::MeasureFonts::default();
+        let _scope = fonts.enter();
+        let font = docx_layout::register_measure_font_bytes(lowering_pages::FONT).unwrap();
+        let bytes = floated_body(|index| {
+            (index % 50 == 10).then(|| floating_table(r#"w:vertAnchor="text""#, index))
+        });
+        let engine = EngineSession::new(9637);
+        crate::seed_from_docx(engine.doc(), &bytes).unwrap();
+        engine.set_local_lowering(true);
+        let request = lowering_pages::region_request(&engine, &bytes, font).to_string();
+        let classified = || FLOAT_TABLE_CLASSIFICATIONS.with(Cell::get);
+        let before = classified();
+        engine
+            .layout_document_with_regions_retained_json(&request)
+            .unwrap();
+        assert!(engine.pagination.borrow().measured_with_floats);
+        assert_eq!(classified() - before, 4, "each table is classified once");
+        let first = {
+            let pagination = engine.pagination.borrow();
+            let LayoutBlock::Paragraph(paragraph) =
+                &pagination.input.as_ref().unwrap().measured[0].block
+            else {
+                panic!("expected the first paragraph");
+            };
+            block_key(&paragraph.id).into_owned()
+        };
+        let mut retained = HashMap::new();
+        assert_certified_float_cold(&engine, &request, &mut retained);
+        let mut typed = 0;
+        let mut moved_reads = 0;
+        for text in ["x", "y", "z"] {
+            // before every table, so each one moves
+            let offset = engine
+                .doc()
+                .paragraph_index("body")
+                .unwrap()
+                .para_span(&first)
+                .unwrap()
+                .0
+                + 1;
+            engine
+                .edit_resident_text(
+                    crate::StoryRange::new("body", offset, offset),
+                    Some(text),
+                    true,
+                )
+                .unwrap();
+            let before = (classified(), MOVED_KEY_READS.with(Cell::get));
+            engine
+                .layout_document_with_regions_after_edit(&request, Some("body"))
+                .unwrap();
+            typed += classified() - before.0;
+            moved_reads += MOVED_KEY_READS.with(Cell::get) - before.1;
+            // the cold session classifies its own
+            assert_certified_float_cold(&engine, &request, &mut retained);
+        }
+        assert_eq!(typed, 0, "moved tables keep their kinds");
+        assert_eq!(moved_reads, 1, "later keystrokes share the moved keys");
+    }
+
+    #[test]
+    fn a_changed_floating_table_is_classified_again() {
+        let fonts = docx_layout::MeasureFonts::default();
+        let _scope = fonts.enter();
+        let font = docx_layout::register_measure_font_bytes(lowering_pages::FONT).unwrap();
+        let bytes = floated_body(|index| {
+            (index % 50 == 10).then(|| floating_table(r#"w:vertAnchor="text""#, index))
+        });
+        let engine = EngineSession::new(9638);
+        crate::seed_from_docx(engine.doc(), &bytes).unwrap();
+        let request = lowering_pages::region_request(&engine, &bytes, font).to_string();
+        engine
+            .layout_document_with_regions_retained_json(&request)
+            .unwrap();
+        let blocks = Rc::clone(&engine.render.borrow().stories["body"].blocks);
+        let widths = engine.pagination.borrow().measured_widths.clone();
+        let input: RegionLayoutInput = serde_json::from_str(&request).unwrap();
+        let (mut layout_input, regions, _, _, _, _) = input.split();
+        apply_section_geometry(&mut layout_input, &regions);
+        let geometry = initial_float_page_geometry(&layout_input, &regions);
+        let measurement: docx_layout::measure_blocks::MeasurementConfig = serde_json::from_value(
+            serde_json::from_str::<serde_json::Value>(&request).unwrap()["measurement"].clone(),
+        )
+        .unwrap();
+        let policy = FloatWidthPolicy::for_document(blocks.iter());
+        let kinds = |blocks: &SharedBlocks| {
+            let before = FLOAT_TABLE_CLASSIFICATIONS.with(Cell::get);
+            let (floats, margin, _) = resident_float_kinds(
+                blocks,
+                &widths,
+                policy,
+                &measurement,
+                &geometry,
+                &engine.float_kinds,
+            )
+            .unwrap();
+            (
+                (floats, margin),
+                FLOAT_TABLE_CLASSIFICATIONS.with(Cell::get) - before,
+            )
+        };
+        assert_eq!(kinds(&blocks), ((true, false), 4));
+        assert_eq!(kinds(&blocks), ((true, false), 0));
+        let mut changed = SharedBlocks::from(blocks.to_vec());
+        let table = changed
+            .shared_mut()
+            .iter_mut()
+            .find(|block| matches!(block.as_ref(), LayoutBlock::Table(_)))
+            .unwrap();
+        let LayoutBlock::Table(table) = Rc::make_mut(table) else {
+            unreachable!()
+        };
+        table.width = Some(table.width.unwrap_or(1800.0) / 2.0);
+        assert_eq!(kinds(&changed), ((true, false), 1));
+        assert_eq!(kinds(&changed), ((true, false), 0));
+        assert_eq!(
+            kinds(&blocks),
+            ((true, false), 1),
+            "only the kinds in use are kept"
+        );
+    }
+
+    #[test]
+    fn typing_in_a_float_free_segment_measures_only_its_paragraph() {
+        let fonts = docx_layout::MeasureFonts::default();
+        let _scope = fonts.enter();
+        let font = docx_layout::register_measure_font_bytes(lowering_pages::FONT).unwrap();
+        let shape = INSIDE_SHAPE
+            .replace("relativeFrom=\"margin\"", "relativeFrom=\"column\"")
+            .replace("<wp:align>inside</wp:align>", "<wp:align>left</wp:align>");
+        let section = r#"<w:sectPr><w:type w:val="nextPage"/><w:pgSz w:w="7200" w:h="8640"/><w:pgMar w:top="300" w:right="300" w:bottom="300" w:left="300"/></w:sectPr>"#;
+        let long = "Long text that wraps across several lines of its page. ".repeat(4);
+        let mut body = String::new();
+        for index in 0..24_u32 {
+            let mut content = String::new();
+            if index == 8 {
+                content.push_str("<w:pPr><w:pageBreakBefore/></w:pPr>");
+            }
+            content.push_str(&preview_fixture::run(&format!("{index} {long}")));
+            if index == 3 {
+                content.push_str(&shape);
+            }
+            body.push_str(&preview_fixture::paragraph(index + 1, &content));
+        }
+        body.push_str(section);
+        let bytes = preview_fixture::document(&body);
+        for trigger in [RelayoutTrigger::Bulk, RelayoutTrigger::Interactive] {
+            let engine = EngineSession::new(9639);
+            crate::seed_from_docx(engine.doc(), &bytes).unwrap();
+            engine.set_local_lowering(true);
+            let request = lowering_pages::region_request(&engine, &bytes, font).to_string();
+            engine.relayout_trigger.set(trigger);
+            engine
+                .layout_regions_for_trigger(&request, None, trigger)
+                .unwrap();
+            assert!(engine.pagination.borrow().measured_with_floats);
+            let mut retained = HashMap::new();
+            assert_certified_float_cold(&engine, &request, &mut retained);
+            for (paragraph, text) in [(12, "x"), (12, " wider words"), (5, "y")] {
+                engine.relayout_trigger.set(trigger);
+                measurement_patch_type(&engine, certified_float_offset(&engine, paragraph), text);
+                let expected = certified_float_dirty_segment(&engine);
+                // the floats' own segment is measured whole
+                assert_eq!(expected.len() == 1, paragraph == 12, "{paragraph}");
+                let (measured, full) = certified_float_layout(&engine, &request, trigger);
+                assert_eq!((measured, full), (expected, 0));
+                assert_certified_float_cold(&engine, &request, &mut retained);
+            }
+        }
+    }
+
+    #[test]
+    fn typing_captures_spacing_only_for_the_blocks_measured_anew() {
+        let fonts = docx_layout::MeasureFonts::default();
+        let _scope = fonts.enter();
+        let font = docx_layout::register_measure_font_bytes(lowering_pages::FONT).unwrap();
+        for trigger in [RelayoutTrigger::Bulk, RelayoutTrigger::Interactive] {
+            let (engine, request) =
+                certified_float_engine(font, 40, &[0, 2, 4], false, false, trigger);
+            let blocks = engine.pagination.borrow().measured_spacing.len() as u64;
+            let mut retained = HashMap::new();
+            for (paragraph, text) in [(28, "x"), (28, " more words"), (20, "z")] {
+                engine.relayout_trigger.set(trigger);
+                measurement_patch_type(&engine, certified_float_offset(&engine, paragraph), text);
+                let before = SPACING_CAPTURES.with(Cell::get);
+                certified_float_layout(&engine, &request, trigger);
+                let captures = SPACING_CAPTURES.with(Cell::get) - before;
+                // the edited paragraph, and the blocks of its segment when floats shape it
+                assert!(
+                    captures > 0 && captures * 3 < blocks,
+                    "{captures} of {blocks}"
+                );
+                assert_eq!(
+                    engine.pagination.borrow().measured_spacing.len() as u64,
+                    blocks
+                );
+                assert_certified_float_cold(&engine, &request, &mut retained);
+            }
+        }
+    }
+
+    #[test]
+    fn the_reuse_walk_captures_spacing_anew_for_a_changed_block() {
+        let _preview = PreviewSwitch::new(Some(true));
+        let fonts = docx_layout::MeasureFonts::default();
+        let _scope = fonts.enter();
+        let engine = EngineSession::new(9694);
+        let paragraph = |id: &str, before: f64| {
+            json!({"kind": "paragraph", "id": id,
+                "runs": [{"kind": "text", "text": "Text", "fontFamily": "Requested"}],
+                "attrs": {"contextualSpacing": true, "spacing": {"before": before, "after": 4.0}}})
+        };
+        let mut blocks: Vec<LayoutBlock> = serde_json::from_value(json!([
+            paragraph("a", 6.0),
+            paragraph("b", 6.0),
+            paragraph("c", 6.0)
+        ]))
+        .unwrap();
+        let request = json!({
+            "measurement": {"defaults": {"fontFamily": "Requested", "fontSize": 12}}
+        });
+        let prepared = engine
+            .prepare_region_layout(&request.to_string(), None, RelayoutTrigger::Preview)
+            .unwrap();
+        let mut measured = Vec::new();
+        let mut dependencies = Vec::new();
+        for block in &blocks {
+            let mut block = block.clone();
+            let (measure, reads) = FontChainDependencies::capture(|| {
+                docx_layout::measure_blocks::measure_block(&mut block, 300.0, &prepared.measurement)
+                    .unwrap()
+            });
+            measured.push(MeasuredBlock { block, measure });
+            dependencies.push(reads);
+        }
+        let retained = BlockSpacing::capture_blocks(blocks.iter(), Some(&prepared.regions));
+        {
+            let mut pagination = engine.pagination.borrow_mut();
+            pagination.input = Some(LayoutInput {
+                measured,
+                options: Default::default(),
+            });
+            pagination.measured_spacing = retained.clone();
+            pagination.block_fingerprints =
+                measured_fingerprints(pagination.input.as_ref().unwrap()).unwrap();
+            pagination.measured_with = Some(prepared.measurement_fingerprint);
+            pagination.measured_float_width_policy =
+                Some(FloatWidthPolicy::for_document(blocks.iter()));
+            pagination.measured_widths = vec![300.0; 3];
+            pagination.set_font_dependencies(dependencies, None);
+        }
+        blocks[1] = serde_json::from_value(paragraph("b", 12.0)).unwrap();
+        let before = SPACING_CAPTURES.with(Cell::get);
+        let (_, _, spacing) = engine
+            .resident_region_measured(
+                &blocks,
+                None,
+                &[300.0; 3],
+                FloatWidthPolicy::for_document(blocks.iter()),
+                &[],
+                &prepared.regions,
+                &prepared.measurement,
+                prepared.measurement_fingerprint,
+                None,
+                None,
+                RelayoutTrigger::Preview,
+            )
+            .unwrap()
+            .unwrap();
+        let spacing = spacing.unwrap();
+        assert!(SPACING_CAPTURES.with(Cell::get) > before);
+        assert_eq!(
+            spacing,
+            BlockSpacing::capture_blocks(blocks.iter(), Some(&prepared.regions))
+        );
+        assert_ne!(spacing[1], retained[1]);
+        assert_eq!(spacing[0], retained[0]);
+    }
+
+    #[test]
+    fn typing_without_note_references_skips_their_scan() {
+        let fonts = docx_layout::MeasureFonts::default();
+        let _scope = fonts.enter();
+        let font = docx_layout::register_measure_font_bytes(lowering_pages::FONT).unwrap();
+        let trigger = RelayoutTrigger::Interactive;
+        let (engine, request) = certified_float_engine(font, 40, &[0, 2, 4], false, false, trigger);
+        let mut retained = HashMap::new();
+        let mut scans = Vec::new();
+        for text in ["x", "y", "z"] {
+            engine.relayout_trigger.set(trigger);
+            measurement_patch_type(&engine, certified_float_offset(&engine, 20), text);
+            let before = NOTE_REF_SCANS.with(Cell::get);
+            certified_float_layout(&engine, &request, trigger);
+            scans.push(NOTE_REF_SCANS.with(Cell::get) - before);
+            assert_certified_float_cold(&engine, &request, &mut retained);
+        }
+        // the opening plain pass found no reference, and no keystroke adds one
+        assert_eq!(scans, [0, 0, 0]);
+
+        // A reference in the arena keeps every pass scanning.
+        let shape = INSIDE_SHAPE
+            .replace("relativeFrom=\"margin\"", "relativeFrom=\"column\"")
+            .replace("<wp:align>inside</wp:align>", "<wp:align>left</wp:align>");
+        let mut body = String::new();
+        for index in 0..24_u32 {
+            let mut content = preview_fixture::run(&format!("Text {index}."));
+            if index == 3 {
+                content.push_str(&shape);
+            }
+            if index == 12 {
+                content.push_str(r#"<w:r><w:footnoteReference w:id="2"/></w:r>"#);
+            }
+            body.push_str(&preview_fixture::paragraph(index + 1, &content));
+        }
+        body.push_str(r#"<w:sectPr><w:pgSz w:w="7200" w:h="8640"/><w:pgMar w:top="300" w:right="300" w:bottom="300" w:left="300"/></w:sectPr>"#);
+        let main = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
+        let parts: Vec<(String, Vec<u8>)> = [
+            ("[Content_Types].xml", r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/></Types>"#.to_owned()),
+            ("_rels/.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="doc" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#.to_owned()),
+            ("word/_rels/document.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="notes" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/></Relationships>"#.to_owned()),
+            ("word/footnotes.xml", format!(r#"<w:footnotes {main}><w:footnote w:id="2"><w:p><w:r><w:t>Note</w:t></w:r></w:p></w:footnote></w:footnotes>"#)),
+            ("word/document.xml", format!(r#"<w:document {main} xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><w:body>{body}</w:body></w:document>"#)),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value.into_bytes()))
+        .collect();
+        let bytes = ooxml_opc::rezip_parts(&parts).unwrap();
+        let engine = EngineSession::new(9693);
+        crate::seed_from_docx(engine.doc(), &bytes).unwrap();
+        engine.set_local_lowering(true);
+        let request = lowering_pages::region_request(&engine, &bytes, font).to_string();
+        engine.relayout_trigger.set(trigger);
+        engine
+            .layout_regions_for_trigger(&request, None, trigger)
+            .unwrap();
+        assert!(engine.pagination.borrow().measured_with_floats);
+        let mut retained = HashMap::new();
+        let blocks = engine
+            .pagination
+            .borrow()
+            .input
+            .as_ref()
+            .unwrap()
+            .measured
+            .len() as u64;
+        for text in ["x", "y"] {
+            engine.relayout_trigger.set(trigger);
+            measurement_patch_type(&engine, certified_float_offset(&engine, 18), text);
+            assert!(engine.measurement_patch().is_some());
+            let before = NOTE_REF_SCANS.with(Cell::get);
+            certified_float_layout(&engine, &request, trigger);
+            assert_eq!(NOTE_REF_SCANS.with(Cell::get) - before, blocks);
+            let env = engine.render.borrow().stories["body"].env.clone();
+            assert_eq!(resident_footnote_marks(&engine), vec![(2, "1".to_owned())]);
+            assert_eq!(
+                resident_footnote_marks(&engine),
+                fresh_footnote_marks(&engine, &env)
+            );
+            assert_certified_float_cold(&engine, &request, &mut retained);
         }
     }
 
@@ -22783,6 +23464,80 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
             partial.as_secs_f64() * 1e3 / f64::from(EDITS),
             renumber.as_secs_f64() * 1e6 / f64::from(EDITS),
         );
+    }
+
+    #[test]
+    fn typing_away_from_note_references_numbers_nothing_again() {
+        use super::lowering_fixture::{Package, para, run};
+
+        let fonts = docx_layout::MeasureFonts::default();
+        let _scope = fonts.enter();
+        let mut body = String::new();
+        let mut notes = format!("<w:footnotes {}>", lowering_fixture::NS);
+        for index in 0..6_usize {
+            let mut content = run(&format!("Paragraph {index}"));
+            if index % 3 == 1 {
+                let id = index / 3 + 1;
+                content.push_str(&format!(r#"<w:r><w:footnoteReference w:id="{id}"/></w:r>"#));
+                notes.push_str(&format!(
+                    r#"<w:footnote w:id="{id}"><w:p><w:r><w:t>Note {id}</w:t></w:r></w:p></w:footnote>"#
+                ));
+            }
+            body.push_str(&para(&format!("{:08X}", 0x10000001 + index), &content));
+        }
+        notes.push_str("</w:footnotes>");
+        let bytes = Package::new(&body)
+            .part(
+                "footnotes.xml",
+                "rIdNotes",
+                "footnotes",
+                "footnotes",
+                &notes,
+            )
+            .bytes();
+        let font = docx_layout::register_measure_font_bytes(lowering_pages::FONT).unwrap();
+        let engine = EngineSession::new(9692);
+        crate::seed_from_docx(engine.doc(), &bytes).unwrap();
+        engine.set_local_lowering(true);
+        let request = small_page_request(font);
+        engine
+            .layout_regions_for_trigger(&request, None, RelayoutTrigger::Bulk)
+            .unwrap();
+        let marks = vec![(1, "1".to_owned()), (2, "2".to_owned())];
+        assert_eq!(resident_footnote_marks(&engine), marks);
+        // A paragraph holding a reference is lowered whole, not patched.
+        for (paragraph, lowered) in [(2, 0), (1, 1), (3, 0), (5, 0), (4, 1), (2, 0)] {
+            let before = (
+                BODY_NOTE_RENUMBERS.with(Cell::get),
+                engine.stats().lower_cache_misses,
+            );
+            let offset = measurement_patch_offset(&engine, paragraph);
+            engine
+                .edit_resident_text(
+                    crate::StoryRange::new("body", offset, offset),
+                    Some("x"),
+                    true,
+                )
+                .unwrap();
+            engine
+                .layout_document_with_regions_after_edit(&request, Some("body"))
+                .unwrap();
+            assert_eq!(
+                (
+                    BODY_NOTE_RENUMBERS.with(Cell::get) - before.0,
+                    engine.stats().lower_cache_misses - before.1,
+                ),
+                (0, lowered),
+                "{paragraph}"
+            );
+            let env = engine.render.borrow().stories["body"].env.clone();
+            assert_eq!(resident_footnote_marks(&engine), marks, "{paragraph}");
+            assert_eq!(
+                resident_footnote_marks(&engine),
+                fresh_footnote_marks(&engine, &env)
+            );
+        }
+        assert_local_patch_matches_cold(&engine, &request, "typing around note references");
     }
 
     #[test]
@@ -25236,10 +25991,79 @@ w:tblpY="0" w:leftFromText="150" w:rightFromText="150"/>
         };
         let mut next = previous.clone();
         crate::bridge::local::shift_block(&mut next.measured[0].block, 7);
-        let deltas = position_deltas(&previous, &next);
+        let deltas = position_deltas(&previous, &next, None, None);
         for key in std::iter::once("outer").chain(keys.iter().map(String::as_str)) {
-            assert_eq!(deltas.get(key), Some(&7), "{key}");
+            assert_eq!(deltas.get(key), Some(7), "{key}");
         }
+        let fingerprints = measured_fingerprints(&next).unwrap();
+        let moved = RefCell::default();
+        let shared = position_deltas(&previous, &next, Some(&fingerprints), Some(&moved));
+        for key in std::iter::once("outer").chain(keys.iter().map(String::as_str)) {
+            assert_eq!(shared.get(key), Some(7), "{key}");
+        }
+        assert_eq!(shared.get("absent"), None);
+    }
+
+    #[test]
+    fn blocks_moved_alike_share_their_keys_until_one_changes() {
+        let paragraph = |id: &str, start: u64| {
+            serde_json::from_value::<LayoutBlock>(json!({
+                "kind": "paragraph", "id": id, "pmStart": start, "pmEnd": start + 5,
+                "runs": [{ "kind": "text", "text": "Text", "pmStart": start + 1, "pmEnd": start + 5 }]
+            }))
+            .unwrap()
+        };
+        let input = |starts: [u64; 4], last: &str| LayoutInput {
+            measured: ["a", "b", "c", last]
+                .into_iter()
+                .zip(starts)
+                .map(|(id, start)| MeasuredBlock {
+                    block: paragraph(id, start),
+                    measure: BlockExtent::Unsupported,
+                })
+                .collect(),
+            options: Default::default(),
+        };
+        let reads = || MOVED_KEY_READS.with(Cell::get);
+        let moved = RefCell::default();
+        let deltas = |previous: &LayoutInput, next: &LayoutInput| {
+            let fingerprints = measured_fingerprints(next).unwrap();
+            let before = reads();
+            let deltas = position_deltas(previous, next, Some(&fingerprints), Some(&moved));
+            let explicit = position_deltas(previous, next, None, None);
+            for key in ["a", "b", "c", "d", "e"] {
+                assert_eq!(deltas.get(key), explicit.get(key), "{key}");
+            }
+            (deltas, reads() - before)
+        };
+        // typing in the first block moves the rest alike
+        let first = input([0, 10, 20, 30], "d");
+        let second = input([0, 11, 21, 31], "d");
+        let third = input([0, 12, 22, 32], "d");
+        let (one, read) = deltas(&first, &second);
+        assert_eq!(
+            (one.get("a"), one.get("b"), one.get("d"), read),
+            (None, Some(1), Some(1), 1)
+        );
+        let (two, read) = deltas(&second, &third);
+        assert_eq!(
+            (two.get("c"), read),
+            (Some(1), 0),
+            "the next keystroke shares them"
+        );
+        let mut pending = one.clone();
+        assert!(pending.add(two));
+        assert_eq!((pending.get("b"), pending.get("a")), (Some(2), None));
+        // a changed block reads them again
+        let renamed = input([0, 13, 23, 33], "e");
+        let (three, read) = deltas(&third, &renamed);
+        assert_eq!((three.get("e"), three.get("d"), read), (None, None, 1));
+        // blocks moved unlike are listed one by one
+        let unlike = input([0, 11, 23, 33], "d");
+        let (four, read) = deltas(&first, &unlike);
+        assert_eq!((four.get("b"), four.get("c"), read), (Some(1), Some(3), 0));
+        assert!(pending.add(four));
+        assert_eq!((pending.get("b"), pending.get("c")), (Some(3), Some(5)));
     }
 
     #[test]

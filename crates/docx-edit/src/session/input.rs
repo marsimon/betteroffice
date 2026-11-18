@@ -220,7 +220,8 @@ impl EditSessionCore {
                 )
                 .map_err(EngineError::message);
             };
-            if selection.story != "body" {
+            let nested = selection.story.starts_with("body:");
+            if selection.story != "body" && !nested {
                 None
             } else {
                 let doc = self.engine.doc();
@@ -237,8 +238,12 @@ impl EditSessionCore {
                 };
                 match (anchor, head) {
                     (Some(anchor), Some(head)) if anchor == head => {
-                        let loc = index_loc(self.engine.doc(), &selection.story, head)?;
-                        Some((loc.para_id, loc.node_offset))
+                        // A cell story the index cannot place keeps the caret to the worker.
+                        match index_loc(self.engine.doc(), &selection.story, head) {
+                            Ok(loc) => Some((loc.para_id, loc.node_offset)),
+                            Err(_) if nested => None,
+                            Err(error) => return Err(error),
+                        }
                     }
                     _ => None,
                 }

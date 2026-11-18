@@ -250,34 +250,43 @@ pub fn suppress_list_auto_spacing(
     }
 }
 
-/// The indices of the blocks that take part in the text flow; anchored
-/// drawings are lowered ahead of their paragraph and sit outside it.
-fn flow_indices<T>(items: &[T], block: impl Fn(&T) -> &LayoutBlock) -> Vec<usize> {
-    (0..items.len())
-        .filter(|&index| crate::header_footer::contributes_to_flow(block(&items[index])))
-        .collect()
-}
-
-/// Splits `items` into the flow neighbours of `flow[k]` and the item itself.
-fn flow_window<'a, T>(
-    items: &'a mut [T],
-    flow: &[usize],
-    k: usize,
-) -> (Option<&'a T>, &'a mut T, Option<&'a T>) {
-    let index = flow[k];
-    let (head, tail) = items.split_at_mut(index);
-    let (current, rest) = tail.split_first_mut().unwrap();
-    let previous = k.checked_sub(1).map(|j| &head[flow[j]]);
-    let next = flow.get(k + 1).map(|&n| &rest[n - index - 1]);
-    (previous, current, next)
+/// Visits each block that takes part in the text flow with its flow
+/// neighbours, in order; anchored drawings are lowered ahead of their paragraph
+/// and sit outside it. The flow is walked in place, as most cells hold one or
+/// two blocks and a body holds tens of thousands.
+fn for_each_flow_window<T>(
+    items: &mut [T],
+    block: impl Fn(&T) -> &LayoutBlock,
+    mut visit: impl FnMut(Option<&LayoutBlock>, &mut T, Option<&LayoutBlock>),
+) {
+    let in_flow = |item: &T| crate::header_footer::contributes_to_flow(block(item));
+    let mut previous = None;
+    let mut current = items.iter().position(in_flow);
+    while let Some(index) = current {
+        let next = items[index + 1..]
+            .iter()
+            .position(in_flow)
+            .map(|offset| index + 1 + offset);
+        let (head, tail) = items.split_at_mut(index);
+        let (item, rest) = tail.split_first_mut().expect("a flow index is in bounds");
+        visit(
+            previous.map(|previous: usize| block(&head[previous])),
+            item,
+            next.map(|next| block(&rest[next - index - 1])),
+        );
+        previous = Some(index);
+        current = next;
+    }
 }
 
 pub fn apply_list_auto_spacing_blocks(blocks: &mut [LayoutBlock]) {
-    let flow = flow_indices(blocks, |block| block);
-    for k in 0..flow.len() {
-        let (previous, current, next) = flow_window(blocks, &flow, k);
-        suppress_list_auto_spacing(current, previous, next);
-    }
+    for_each_flow_window(
+        blocks,
+        |block| block,
+        |previous, current, next| {
+            suppress_list_auto_spacing(current, previous, next);
+        },
+    );
     for block in blocks.iter_mut() {
         if let LayoutBlock::Table(table) = block {
             for row in &mut table.rows {
@@ -329,7 +338,16 @@ pub(crate) fn contextual_spacing_pair(curr: &mut LayoutBlock, next: &mut LayoutB
 }
 
 pub fn apply_contextual_spacing_blocks(blocks: &mut [LayoutBlock]) {
-    apply_list_auto_spacing_blocks(blocks);
+    // The rules read only the neighbours' numbering, styles and content, never
+    // the spacing they zero, so each level is visited once: nested tables take
+    // their list rules in the recursion below.
+    for_each_flow_window(
+        blocks,
+        |block| block,
+        |previous, current, next| {
+            suppress_list_auto_spacing(current, previous, next);
+        },
+    );
     for i in 0..blocks.len().saturating_sub(1) {
         let (head, tail) = blocks.split_at_mut(i + 1);
         contextual_spacing_pair(&mut head[i], &mut tail[0]);
@@ -348,19 +366,18 @@ pub fn apply_contextual_spacing_blocks(blocks: &mut [LayoutBlock]) {
 /// Zeroes the spacing that contextual, list and break rules suppress, as placement
 /// does before it reads any spacing. Applying it again changes nothing.
 pub fn apply_contextual_spacing_measured(measured: &mut [MeasuredBlock]) {
-    let flow = flow_indices(measured, |entry| &entry.block);
-    if let Some(&first) = flow.first() {
-        suppress_document_auto_before(&mut measured[first].block);
-    }
-    for k in 0..flow.len() {
-        let (previous, current, next) = flow_window(measured, &flow, k);
-        suppress_break_auto_before(&mut current.block, previous.map(|entry| &entry.block));
-        suppress_list_auto_spacing(
-            &mut current.block,
-            previous.map(|entry| &entry.block),
-            next.map(|entry| &entry.block),
-        );
-    }
+    let mut first = true;
+    for_each_flow_window(
+        measured,
+        |entry| &entry.block,
+        |previous, current, next| {
+            if std::mem::take(&mut first) {
+                suppress_document_auto_before(&mut current.block);
+            }
+            suppress_break_auto_before(&mut current.block, previous);
+            suppress_list_auto_spacing(&mut current.block, previous, next);
+        },
+    );
     for i in 0..measured.len().saturating_sub(1) {
         let (head, tail) = measured.split_at_mut(i + 1);
         contextual_spacing_pair(&mut head[i].block, &mut tail[0].block);

@@ -773,6 +773,15 @@ struct TableMembership {
     cells: std::collections::HashSet<String>,
 }
 
+/// The table embeds of each story read so far, in ordinal order with their story offsets, as of
+/// one committed epoch. A plain text edit inside one paragraph carries them to the next epoch:
+/// it moves no embed and changes no ordinal, only the offsets past it.
+#[derive(Default)]
+struct TableEmbeds {
+    epoch: u64,
+    stories: HashMap<String, Arc<Vec<(u32, MapRef)>>>,
+}
+
 type CommitHookFn = Box<dyn Fn(&yrs::TransactionMut)>;
 
 #[derive(Default)]
@@ -830,6 +839,7 @@ pub struct EditingDoc {
     chunk_snapshots: Mutex<EpochCache<Vec<ops::Chunk>>>,
     revision_lists: Mutex<read_state::RevisionLists>,
     table_membership: Mutex<Option<TableMembership>>,
+    table_embeds: Mutex<TableEmbeds>,
     resident_geometry: Mutex<HashMap<String, resident_geometry::ResidentGeometryIndex>>,
     shared_read_depth: AtomicU32,
     /// Story projections held only inside a shared-read scope.
@@ -945,6 +955,7 @@ impl EditingDoc {
             chunk_snapshots: Mutex::default(),
             revision_lists: Mutex::default(),
             table_membership: Mutex::default(),
+            table_embeds: Mutex::default(),
             resident_geometry: Mutex::default(),
             shared_read_depth: AtomicU32::new(0),
             story_views: Mutex::default(),
@@ -1160,6 +1171,12 @@ impl EditingDoc {
             return;
         }
         let index = self.text_insert_index(story_id, before, index);
+        self.advance_table_embeds(
+            story_id,
+            before,
+            after,
+            Some((index, text.encode_utf16().count() as i64)),
+        );
         let at = self
             .paragraph_indexes
             .lock()
@@ -1244,6 +1261,14 @@ impl EditingDoc {
                     .filter(|para| start <= end && start >= para.node_start && end <= para.pilcrow)
                     .map(|para| (para.para_id.to_string(), end - para.node_start))
             });
+        // Inside one paragraph's inline content the deletion removes no table embed.
+        self.advance_table_embeds(
+            story_id,
+            before,
+            after,
+            at.as_ref()
+                .map(|_| (end, -i64::from(end.saturating_sub(start)))),
+        );
         self.advance_resident_geometry(
             story_id,
             before,
@@ -1267,6 +1292,72 @@ impl EditingDoc {
             }
         }
         self.advance_table_membership(before, after);
+    }
+
+    /// Carries the table embeds read at `before` to `after` across one plain text edit of
+    /// `story_id`: offsets at or past `shift.0` move by `shift.1`. Without a shift the story's
+    /// embeds are dropped and read afresh.
+    fn advance_table_embeds(
+        &self,
+        story_id: &str,
+        before: u64,
+        after: u64,
+        shift: Option<(u32, i64)>,
+    ) {
+        let mut cache = self.table_embeds.lock().unwrap();
+        if cache.epoch != before {
+            return;
+        }
+        cache.epoch = after;
+        let Some((from, delta)) = shift else {
+            cache.stories.remove(story_id);
+            return;
+        };
+        if let Some(embeds) = cache.stories.get_mut(story_id) {
+            let moved = embeds
+                .iter()
+                .map(|(offset, map)| {
+                    let offset = if *offset >= from {
+                        u32::try_from(i64::from(*offset) + delta).ok()
+                    } else {
+                        Some(*offset)
+                    };
+                    offset.map(|offset| (offset, map.clone()))
+                })
+                .collect::<Option<Vec<_>>>();
+            match moved {
+                Some(moved) => *embeds = Arc::new(moved),
+                None => {
+                    cache.stories.remove(story_id);
+                }
+            }
+        }
+    }
+
+    /// The table embeds of `story` in ordinal order with their story offsets, read once per
+    /// committed epoch (see [`TableEmbeds`]).
+    pub(crate) fn table_embeds<T: ReadTxn>(
+        &self,
+        story_id: &str,
+        story: &TextRef,
+        txn: &T,
+    ) -> Arc<Vec<(u32, MapRef)>> {
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        let mut cache = self.table_embeds.lock().unwrap();
+        if cache.epoch != epoch {
+            cache.stories.clear();
+            cache.epoch = epoch;
+        }
+        if let Some(embeds) = cache.stories.get(story_id) {
+            return Arc::clone(embeds);
+        }
+        #[cfg(test)]
+        TABLE_EMBED_SCANS.with(|scans| scans.set(scans.get() + 1));
+        let embeds = Arc::new(ops::table::table_embeds_in(story, txn));
+        cache
+            .stories
+            .insert(story_id.to_owned(), Arc::clone(&embeds));
+        embeds
     }
 
     fn advance_table_membership(&self, before: u64, after: u64) {
@@ -2469,6 +2560,7 @@ thread_local! {
     pub(crate) static SNAPSHOT_DIFFS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static PILCROW_DIFFS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static TABLE_MEMBERSHIP_STORIES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static TABLE_EMBED_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn segment_content<T: ReadTxn>(value: Out, txn: &T) -> SegmentContent {

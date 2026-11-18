@@ -1,4 +1,5 @@
 use super::*;
+use crate::TableLocator;
 use crate::op::{loc_in_bounds, loc_range_in_txn, para_bounds};
 use crate::{EditCtx, EditingDoc, FormatPolicy, Position, RawOp, SeedParagraph};
 use yrs::Transact;
@@ -511,4 +512,140 @@ fn paragraph_edits_copy_only_the_selected_paragraphs() {
             }
         }
     }
+}
+
+/// The cached table embeds of `story_id` match a fresh read, and the lookups built on them agree.
+fn assert_table_embeds(doc: &EditingDoc, story_id: &str) {
+    let (cached, fresh) = {
+        let txn = doc.yrs_doc().transact();
+        let story = crate::story_ref(&txn, story_id).unwrap();
+        let cached = doc.table_embeds(story_id, &story, &txn);
+        let fresh = table::table_embeds_in(&story, &txn);
+        let payloads = |embeds: &[(u32, yrs::MapRef)]| {
+            embeds
+                .iter()
+                .map(|(offset, map)| (*offset, crate::embed_payload(map, &txn)))
+                .collect::<Vec<_>>()
+        };
+        (payloads(&cached), payloads(&fresh))
+    };
+    assert_eq!(cached, fresh);
+    for (ordinal, (offset, payload)) in fresh.iter().enumerate() {
+        let locator = TableLocator::new(story_id, ordinal as u32);
+        assert_eq!(doc.table_embed_index(&locator).unwrap(), *offset);
+        assert_eq!(
+            doc.table_locator_at_index(story_id, *offset).unwrap(),
+            locator
+        );
+        assert_eq!(&doc.table_payload(&locator).unwrap(), payload);
+    }
+    assert!(
+        doc.table_payload(&TableLocator::new(story_id, fresh.len() as u32))
+            .is_err()
+    );
+}
+
+#[test]
+fn table_embeds_follow_plain_edits_and_reread_after_other_changes() {
+    let doc = EditingDoc::new(9);
+    let ctx = EditCtx::local("", "");
+    doc.create_story("body", "Alpha", "Normal", "left").unwrap();
+    for _ in 0..3 {
+        let end = doc.story_len("body").unwrap();
+        doc.insert_table(&ctx, Position::new("body", end), 1, 2)
+            .unwrap();
+    }
+    assert_table_embeds(&doc, "body");
+    let cell = TableLocator::new("body", 1);
+    let cell_story = {
+        let payload = doc.table_payload(&cell).unwrap();
+        let Some(Any::Array(rows)) = payload.get("rows") else {
+            panic!("rows")
+        };
+        let Any::Map(row) = &rows[0] else {
+            panic!("row")
+        };
+        let Some(Any::Array(cells)) = row.get("cells") else {
+            panic!("cells")
+        };
+        let Any::Map(first) = &cells[0] else {
+            panic!("cell")
+        };
+        let Some(Any::String(story)) = first.get("story") else {
+            panic!("story")
+        };
+        story.to_string()
+    };
+    crate::TABLE_EMBED_SCANS.set(0);
+    for step in 0..8u32 {
+        // plain typing and deleting before the tables carries the cache
+        doc.paragraph_index("body").unwrap();
+        let before = doc.committed_epoch();
+        doc.insert_text(&ctx, Position::new("body", 1), "xy", FormatPolicy::Inherit)
+            .unwrap();
+        doc.advance_indexes_after_text_insert("body", before, doc.committed_epoch(), 1, "xy");
+        assert_table_embeds(&doc, "body");
+        let before = doc.committed_epoch();
+        doc.delete_range(&ctx, StoryRange::new("body", 1 + step % 2, 2 + step % 2))
+            .unwrap();
+        doc.advance_indexes_after_text_delete(
+            "body",
+            before,
+            doc.committed_epoch(),
+            1 + step % 2,
+            2 + step % 2,
+        );
+        assert_table_embeds(&doc, "body");
+        // typing in a cell story leaves the body's tables where they are
+        let before = doc.committed_epoch();
+        doc.insert_text(
+            &ctx,
+            Position::new(cell_story.as_str(), 0),
+            "c",
+            FormatPolicy::Inherit,
+        )
+        .unwrap();
+        doc.advance_indexes_after_text_insert(&cell_story, before, doc.committed_epoch(), 0, "c");
+        assert_table_embeds(&doc, "body");
+    }
+    assert_eq!(
+        crate::TABLE_EMBED_SCANS.get(),
+        0,
+        "plain edits re-read the body's tables"
+    );
+
+    // a deletion the paragraph index cannot place drops the story's tables; they are read again
+    let before = doc.committed_epoch();
+    doc.delete_range(&ctx, StoryRange::new("body", 1, 2))
+        .unwrap();
+    doc.advance_indexes_after_text_delete("body", before, doc.committed_epoch(), 1, 2);
+    assert_table_embeds(&doc, "body");
+    assert_eq!(crate::TABLE_EMBED_SCANS.get(), 1);
+
+    // deleting a table, inserting one, and a remote merge each move to a new epoch unadvanced
+    let first = doc
+        .table_embed_index(&TableLocator::new("body", 0))
+        .unwrap();
+    doc.delete_range(&ctx, StoryRange::new("body", first, first + 1))
+        .unwrap();
+    assert_table_embeds(&doc, "body");
+    doc.insert_table(&ctx, Position::new("body", 0), 2, 1)
+        .unwrap();
+    assert_table_embeds(&doc, "body");
+    let peer = EditingDoc::new(10);
+    peer.apply_update_v1(&doc.encode_state_as_update_v1())
+        .unwrap();
+    let end = peer.story_len("body").unwrap();
+    peer.insert_table(&ctx, Position::new("body", end), 1, 1)
+        .unwrap();
+    peer.insert_text(
+        &ctx,
+        Position::new("body", 0),
+        "remote",
+        FormatPolicy::Inherit,
+    )
+    .unwrap();
+    doc.apply_update_v1(&peer.encode_state_as_update_v1())
+        .unwrap();
+    assert_table_embeds(&doc, "body");
 }
