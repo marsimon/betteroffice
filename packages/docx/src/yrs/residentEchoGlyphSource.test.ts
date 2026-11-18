@@ -36,12 +36,13 @@ test('retained glyph providers read shipped sets and cached ink without building
 function growingEngine() {
   const calls: { alphabet: string; known?: number }[] = [];
   const renumbered = new Set<string>();
+  const scale = { horizontal: 0.01 };
   const engine: EchoGlyphEngine = {
     echoGlyphSetJson(_font: number, _size: number, _kern: boolean, alphabet: string, _language?: string, known?: number) {
       calls.push({ alphabet, known });
       const chars = [...alphabet];
       return JSON.stringify({
-        horizontal: 0.01,
+        horizontal: scale.horizontal,
         glyphIds: chars.map((char) => renumbered.has(char) ? 9999 : char.codePointAt(0)!),
         advances: chars.map(() => 500),
         kerning: chars.slice(known ?? 0).map((_, index) => [(known ?? 0) + index, 0, -1]),
@@ -52,7 +53,7 @@ function growingEngine() {
       return JSON.stringify({ upem: 1000, cmds: [{ t: 'M', x: 0, y: 0 }, { t: 'L', x: 400, y: 700 }, { t: 'Z' }] });
     },
   };
-  return { engine, calls, renumbered };
+  return { engine, calls, renumbered, scale };
 }
 
 const naming = (key: string) => ({ glyphs: { faces: [{ glyphSet: key }] } }) as unknown as DocxCommandEchoContext;
@@ -98,7 +99,7 @@ test('a set grows by what its new characters add, sent as growth only to a main 
 });
 
 test('a set whose earlier glyphs shape differently, or that would grow too large, is built again whole', () => {
-  const { engine, calls, renumbered } = growingEngine();
+  const { engine, calls, renumbered, scale } = growingEngine();
   const sources = new EchoGlyphSources(engine, 1);
   const provider = sources.provider(1);
   sources.sent([provider.glyphSet(1, 12, false, undefined)!.glyphs.set]);
@@ -109,6 +110,15 @@ test('a set whose earlier glyphs shape differently, or that would grow too large
   expect(sent!.extends).toBeUndefined();
   expect(sent!.glyphIds[DOCX_ECHO_ALPHABET.indexOf('a')]).toBe(9999);
   sources.sent([sent!]);
+
+  // a growth that would scale the earlier advances differently is built again whole too
+  scale.horizontal = 0.02;
+  const rescaled = provider.glyphSet(1, 12, false, undefined, '가나')!;
+  expect(calls.slice(-2).map((call) => call.known)).toEqual([[...DOCX_ECHO_ALPHABET].length + 1, undefined]);
+  const [whole] = sources.unsent(naming(rescaled.key));
+  expect(whole!.extends).toBeUndefined();
+  expect(whole!.horizontal).toBe(0.02);
+  sources.sent([whole!]);
 
   const many = Array.from({ length: 1000 }, (_, index) => String.fromCharCode(0xac00 + index)).join('');
   const large = provider.glyphSet(1, 12, false, undefined, many)!;

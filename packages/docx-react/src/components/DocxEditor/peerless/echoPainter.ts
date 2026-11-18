@@ -510,11 +510,19 @@ function applyIntent(draft: EchoDraft, intent: PeerlessTextIntent, line?: DocxCo
   let start = Math.min(draft.anchor, draft.focus);
   let end = Math.max(draft.anchor, draft.focus);
   let replacement = '';
+  let replacesStep = false;
   const boundaries = [0];
   for (const point of draft.text) boundaries.push(boundaries[boundaries.length - 1]! + point.length);
   if (intent.kind === 'insertText' || intent.kind === 'replaceSelection') {
-    // A composition step types over the step before it; the echo does not draw it.
-    if ('replaceBefore' in intent.payload && intent.payload.replaceBefore !== undefined) return undefined;
+    // A composition step types over the step before it, which the engine replaces only while it
+    // is exactly the text before the caret
+    const before = 'replaceBefore' in intent.payload ? intent.payload.replaceBefore : undefined;
+    if (before !== undefined) {
+      if (start !== end || !before || start < before.length || draft.text.slice(start - before.length, start) !== before ||
+        !boundaries.includes(start - before.length)) return undefined;
+      start -= before.length;
+      replacesStep = true;
+    }
     replacement = intent.payload.text;
     if (!simpleText(replacement)) return undefined;
   } else if (start === end) {
@@ -542,7 +550,9 @@ function applyIntent(draft: EchoDraft, intent: PeerlessTextIntent, line?: DocxCo
     if (face < 0) return undefined;
     faces.push(face);
   }
-  if (faces.length && (from === 0 || !draft.own[from - 1])) return undefined;
+  // typed text takes the formatting left of it; a replaced selection's is the engine's to choose,
+  // while a replaced composition step was itself typed there
+  if (faces.length && (from === 0 || !draft.own[from - 1] || start !== end && !replacesStep)) return undefined;
   next.faces = [...draft.faces.slice(0, from), ...faces, ...draft.faces.slice(to)];
   next.own = [...draft.own.slice(0, from), ...faces.map(() => true), ...draft.own.slice(to)];
   return next;

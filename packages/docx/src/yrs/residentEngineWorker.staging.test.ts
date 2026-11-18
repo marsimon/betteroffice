@@ -90,6 +90,7 @@ async function stageRequestedPages(requested: number[], damaged: number[] = [], 
     hooks: { editState: () => ({ storedMarks: null }), selection: () => null },
     // no stored marks: typing takes the caret's own formatting
     storedMarksChangeTyping: () => false,
+    recentTyped: new Set<string>(),
     projectCommandEchoContext: () => echoContext,
     commandEchoGlyphs: () => ({ provider: () => undefined,
       unsent: (context?: DocxCommandEchoContext) => context?.glyphs ? [echoGlyphSet] : [], sent() {} }),

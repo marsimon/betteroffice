@@ -47,6 +47,8 @@ export interface ProjectCommandEchoContextInput {
   layout: DocxCommandSelectionLayout;
   /** Without it the context carries no exact glyph line. */
   glyphs?: EchoGlyphProvider;
+  /** Characters typed lately, which glyph sets carry beside the caret paragraph's for typing them again. */
+  recent?: string;
 }
 
 /** @internal Undefined declines echo, including when the serialized context exceeds the cap. */
@@ -311,7 +313,8 @@ export function projectCommandEchoContext(
           const json = facesJson(position, alphabet, lineStart, lineEnd);
           return json === undefined ? undefined : JSON.parse(json) as EchoFacesAnswer;
         } } : {}),
-        paragraphText: paragraph.text, lineOffset, start, end, paragraphStart, paragraphEnd });
+        paragraphText: paragraph.text, ...(input.recent ? { recent: input.recent } : {}),
+        lineOffset, start, end, paragraphStart, paragraphEnd });
       if (!projected) return undefined;
       ({ line: glyphLine, rect: damageRect } = projected);
     }
@@ -387,6 +390,7 @@ interface GlyphLineInput {
   /** The table cell clip the engine paints the line inside, in page px. */
   clip?: { x: number; y: number; w: number; h: number };
   paragraphText: string;
+  recent?: string;
   lineOffset: number;
   start: number;
   end: number;
@@ -477,7 +481,7 @@ function projectGlyphLine(input: GlyphLineInput): { line: DocxEchoGlyphLine; rec
     // pairs kern within one face only where the line does not mix faces
     if (kern || !input.faces) return undefined;
     const lineChars = [...text];
-    const alphabet = [...new Set(DOCX_ECHO_ALPHABET + DOCX_ECHO_JAMO + input.paragraphText)].join('');
+    const alphabet = [...new Set(DOCX_ECHO_ALPHABET + DOCX_ECHO_JAMO + input.paragraphText + (input.recent ?? ''))].join('');
     const caretPosition = input.start + Math.max(0, input.caret - 1);
     const answer = input.faces(caretPosition, alphabet, input.start, input.end + next.length);
     if (!answer || answer.faces.length !== [...alphabet].length) return undefined;

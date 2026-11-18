@@ -3740,8 +3740,9 @@ test('typing after a paragraph that holds only a page break echoes the caret par
  * typed characters take the faces the engine routes them to, the line keeps its line metrics faces,
  * and each character advances by its own face's glyph set. Undefined where the echo declines.
  */
-function predictEcho(context: DocxCommandEchoContext, sets: ReadonlyMap<string, DocxEchoGlyphSet>,
-  edit: { insert: string } | { deleteBackward: true }) {
+type EchoEdit = { insert: string; replaceBefore?: string; first?: true } | { deleteBackward: true };
+
+function predictEcho(context: DocxCommandEchoContext, sets: ReadonlyMap<string, DocxEchoGlyphSet>, edit: EchoEdit) {
   const line = context.glyphs;
   if (!line?.faces || !line.charFaces || line.shapingSize === undefined) return undefined;
   const focus = context.boundaries.find((boundary) => boundary.grapheme === context.selection.focusGrapheme)!.utf16;
@@ -3751,11 +3752,15 @@ function predictEcho(context: DocxCommandEchoContext, sets: ReadonlyMap<string, 
   let faces = [...line.charFaces];
   let text: string;
   if ('insert' in edit) {
+    // a composition step types over the step before it
+    const before = edit.replaceBefore ?? '';
+    const from = offsets.indexOf(focus - before.length);
+    if (from < 0 || context.text.slice(focus - before.length, focus) !== before) return undefined;
     const typed = [...edit.insert].map((char) => line.typed?.findIndex((chars) => chars.includes(char)) ?? -1);
-    if (typed.some((face) => face < 0) || !line.typedRun || at === 0 || offsets[at - 1]! < line.typedRun[0] ||
-      offsets[at - 1]! >= line.typedRun[1]) return undefined;
-    faces = [...faces.slice(0, at), ...typed, ...faces.slice(at)];
-    text = context.text.slice(0, focus) + edit.insert + context.text.slice(focus);
+    if (typed.length && (typed.some((face) => face < 0) || !line.typedRun || from === 0 ||
+      offsets[from - 1]! < line.typedRun[0] || offsets[from - 1]! >= line.typedRun[1])) return undefined;
+    faces = [...faces.slice(0, from), ...typed, ...faces.slice(at)];
+    text = context.text.slice(0, focus - before.length) + edit.insert + context.text.slice(focus);
   } else {
     if (at === 0) return undefined;
     faces.splice(at - 1, 1);
@@ -3812,13 +3817,16 @@ function echoParity(client: ResidentEngineWorkerClient, initial: Pick<DocxComman
     state.version = ack.version;
     receive(ack);
   };
-  const key = async (edit: { insert: string } | { deleteBackward: true }) => {
+  const key = async (edit: EchoEdit) => {
     const context = state.context;
     const predicted = context && predictEcho(context, sets, edit);
     const page = context?.page.pageIndex ?? 0;
     // a cell's line ends at its right edge; the next cell's text shares its baseline
     const right = context?.glyphs?.right ?? Infinity;
-    await send('insert' in edit ? 'insertText' : 'deleteBackward', 'insert' in edit ? { text: edit.insert } : {});
+    if ('insert' in edit) {
+      await send(edit.first ? 'replaceSelection' : 'insertText',
+        { text: edit.insert, ...(edit.replaceBefore === undefined ? {} : { replaceBefore: edit.replaceBefore }) });
+    } else await send('deleteBackward', {});
     if (!predicted) return false;
     expect(paintedLine(state.frame!, page, predicted.y, predicted.text, right)).toEqual(predicted);
     state.echoed += 1;
@@ -3924,6 +3932,32 @@ test('keys typed with Ctrl+B echo once the text left of the caret has that forma
     await send('deleteBackward', {});
     expect(parity.context).toBeUndefined();
     expect(parity.echoed).toBe(6);
+  } finally { client.destroy(); }
+}, TIMEOUT);
+
+test('composition steps echo glyph for glyph where the engine then paints them', async () => {
+  const korean = '<w:rFonts w:ascii="Liberation Sans" w:hAnsi="Liberation Sans" w:eastAsia="Noto Sans KR"/>';
+  const { client, engine, initial } = await openWorker({ korean: true,
+    bodyXml: `<w:p w14:paraId="00000001"><w:r><w:rPr>${korean}</w:rPr><w:t xml:space="preserve">가나 echo 한국 text</w:t></w:r></w:p>`,
+    prepare: () => ({ story: 'body', paraId: '00000001', offset: 2 }) });
+  try {
+    const parity = echoParity(client, initial);
+    const { send, key } = parity;
+    await send('insertText', { text: '나' });
+    // 한: a jamo, a passing syllable no glyph set holds yet, then the syllable the paragraph holds
+    expect(await key({ insert: 'ㅎ', first: true })).toBe(true);
+    expect(await key({ insert: '하', replaceBefore: 'ㅎ' })).toBe(false);
+    expect(await key({ insert: '한', replaceBefore: '하' })).toBe(true);
+    expect(engine.paragraphs('body')[0]!.text.startsWith('가나나한 ')).toBe(true);
+    // 하 again: the passing syllable typed a moment ago echoes though the paragraph no longer holds it
+    expect(engine.paragraphs('body')[0]!.text.includes('하')).toBe(false);
+    expect(await key({ insert: 'ㅎ', first: true })).toBe(true);
+    expect(await key({ insert: '하', replaceBefore: 'ㅎ' })).toBe(true);
+    // a cancelled composition removes what its steps typed
+    expect(await key({ insert: '', replaceBefore: '하' })).toBe(true);
+    // a step whose text is not before the caret is the engine's to refuse
+    expect(parity.context && predictEcho(parity.context, new Map(), { insert: '국', replaceBefore: 'ㄱ' })).toBeUndefined();
+    expect(parity.echoed).toBe(5);
   } finally { client.destroy(); }
 }, TIMEOUT);
 

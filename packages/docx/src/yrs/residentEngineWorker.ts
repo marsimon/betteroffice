@@ -19,6 +19,7 @@ import { readDocxSelectionFocus, releaseResidentSelectionReads } from './residen
 import { currentSelectionRange, readCommandStickyPosition } from './residentCommandAnchors';
 import { projectCommandEchoContext } from './residentCommandViewProjection';
 import { EchoGlyphSources, type EchoGlyphEngine } from './residentEchoGlyphSource';
+import { DOCX_ECHO_ALPHABET, DOCX_ECHO_JAMO } from './residentEchoGlyphs';
 import { echoBackgroundPage, stageCommandPresentation } from './residentCommandPresentation';
 import { registerCommandFonts } from './residentCommandFonts';
 import { residentSourceMetadata, validateResidentSource, type DocxSourceOpenRequest, type DocxSourcePreviewOptions } from './residentSource';
@@ -223,6 +224,9 @@ function reportQueryParseFailure(frame: RetainedFrame, version: string, error: u
     error: error instanceof Error ? error.message : String(error), queryParseFailures: ++queryParseFailures,
   });
 }
+
+/** How many lately typed characters the echo's glyph sets keep beside the caret paragraph's. */
+const DOCX_ECHO_RECENT_CHARS = 128;
 
 function bindResidentCommands(init: DocxCommandInitRequest): DocxCommandHost {
   if (!session) throw new Error('Document worker is not initialized');
@@ -617,6 +621,20 @@ function bindResidentCommands(init: DocxCommandInitRequest): DocxCommandHost {
     }
   };
   let revision = 0;
+  // characters typed lately beyond the echo's base alphabet, newest last: typing them again echoes
+  // even where the caret paragraph no longer holds them, as a composition's passing syllables
+  const recentTyped = new Set<string>();
+  const rememberTyped = (text: string) => {
+    for (const char of text) {
+      if (DOCX_ECHO_ALPHABET.includes(char) || DOCX_ECHO_JAMO.includes(char)) continue;
+      recentTyped.delete(char);
+      recentTyped.add(char);
+    }
+    for (const char of recentTyped) {
+      if (recentTyped.size <= DOCX_ECHO_RECENT_CHARS) break;
+      recentTyped.delete(char);
+    }
+  };
   // the echo draws typing as plain typing at the caret, which cursor formatting may change
   const storedMarksChangeTyping = () => {
     const stored = hooks.editState().storedMarks;
@@ -636,7 +654,7 @@ function bindResidentCommands(init: DocxCommandInitRequest): DocxCommandHost {
         const projected = projectCommandEchoContext({
           engine: engine as DocxWorkerCommandEngine, selection: hooks.selection(),
           layout: { frame: retainedFrame, layoutRevision },
-          glyphs: echoGlyphState.sources.provider(offscreenDpr * offscreenZoom, true),
+          glyphs: echoGlyphState.sources.provider(offscreenDpr * offscreenZoom, true), recent: [...recentTyped].join(''),
         });
         return projected?.glyphs ? projected : undefined;
       },
@@ -645,6 +663,10 @@ function bindResidentCommands(init: DocxCommandInitRequest): DocxCommandHost {
     hooks: {
       ...hooks,
       async preflight(command, context) {
+        if (command.kind === 'insertText' || command.kind === 'replaceSelection') {
+          const text = (command.payload as { text?: unknown } | null)?.text;
+          if (typeof text === 'string') rememberTyped(text);
+        }
         (changes.causes ??= new Set()).add(
           ['select', 'selectPoint', 'extendSelection', 'navigate', 'selectTableCells'].includes(command.kind) ? 'selection' : 'other');
         if (command.kind === 'selectPoint' || command.kind === 'extendSelection' || command.kind === 'navigate' || command.kind === 'moveEmbed') {
@@ -1000,7 +1022,7 @@ function bindResidentCommands(init: DocxCommandInitRequest): DocxCommandHost {
         const echoGlyphs = commandEchoGlyphs(glyphCache, engine, full);
         const projectedEcho = storedMarksChangeTyping() ? undefined : projectCommandEchoContext({
           engine: engine as DocxWorkerCommandEngine, selection: hooks.selection(), layout,
-          glyphs: echoGlyphs.provider(pixelRatio),
+          glyphs: echoGlyphs.provider(pixelRatio), recent: [...recentTyped].join(''),
         });
         if (selectionContext && projectedEcho?.glyphs) requestedPages.add(projectedEcho.page.pageIndex);
         const echoContext = projectedEcho?.glyphs && (full || requestedPages.has(projectedEcho.page.pageIndex) ||

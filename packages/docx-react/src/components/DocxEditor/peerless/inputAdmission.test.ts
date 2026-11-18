@@ -191,12 +191,26 @@ test('a matching fence ack context attaches queued text before presentation', as
   h.admission.dispose();
 });
 
-for (const excluded of ['epoch mismatch', 'composition', 'read-only', 'different fence'] as const) {
+test('a fence ack context during composition attaches queued text and the steps typed so far', () => {
+  const h = lane();
+  admitIntent(h.admission, { kind: 'navigate', payload: { unit: 'character', direction: 'forward', extend: false } });
+  admitIntent(h.admission, { kind: 'insertText', payload: { text: 'a' } });
+  const reservation = h.admission.reserveComposition();
+  expect(h.admission.composeText(reservation.slot, 'ㄱ')).toMatchObject({ status: 'submitted', echoEnabled: false });
+  h.ackContext(1);
+  expect(h.submitted.slice(1).map(({ options }) => options.echo?.intent.payload)).toEqual([{ text: 'a' }, { text: 'ㄱ' }]);
+  expect(h.admission.getSnapshot().echoDisabledReason).toBeNull();
+  // the next step echoes as it is typed
+  expect(h.admission.composeText(reservation.slot, '가')).toMatchObject({ status: 'submitted', echoEnabled: true });
+  expect(h.submitted[3]!.options.echo?.intent.payload).toEqual({ text: '가', replaceBefore: 'ㄱ' });
+  h.admission.dispose();
+});
+
+for (const excluded of ['epoch mismatch', 'read-only', 'different fence'] as const) {
   test(`fence ack context does not attach text during ${excluded}`, () => {
     const h = lane();
     admitIntent(h.admission, { kind: 'navigate', payload: { unit: 'character', direction: 'forward', extend: false } });
     admitIntent(h.admission, { kind: 'insertText', payload: { text: 'a' } });
-    if (excluded === 'composition') h.admission.reserveComposition();
     if (excluded === 'read-only') h.admission.setReadOnly(true);
     const install = spyOn(h.echoPainter, 'installAckContext');
     h.ackContext(excluded === 'different fence' ? 2 : 1, excluded === 'epoch mismatch' ? 2 : 1);
@@ -1097,16 +1111,17 @@ test('composition_steps_type_into_the_document_and_a_matching_commit_sends_nothi
   const { admission, submitted } = lane();
   admitIntent(admission, { kind: 'insertText', payload: { text: 'a' } });
   const reservation = admission.reserveComposition(100);
-  expect(admission.composeText(reservation.slot, 'ㄱ', 110)).toMatchObject({ status: 'submitted', echoEnabled: false });
-  expect(admission.composeText(reservation.slot, '가', 120)).toMatchObject({ status: 'submitted' });
+  // each step is an edit the echo draws as it is typed
+  expect(admission.composeText(reservation.slot, 'ㄱ', 110)).toMatchObject({ status: 'submitted', echoEnabled: true });
+  expect(admission.composeText(reservation.slot, '가', 120)).toMatchObject({ status: 'submitted', echoEnabled: true });
   expect(admission.composeText(reservation.slot, '가', 125)).toBeUndefined();
   expect(submitted.map(({ kind, payload }) => [kind, payload]) as unknown[]).toEqual([
     ['insertText', { text: 'a' }], ['replaceSelection', { text: 'ㄱ' }], ['insertText', { text: '가', replaceBefore: 'ㄱ' }],
   ]);
   expect(submitted[1]!.options).toMatchObject({ after: submitted[0]!.ticket, fence: true, inputTime: 100, lastInputTime: 110 });
   expect(submitted[2]!.options).toMatchObject({ after: submitted[1]!.ticket, fence: true, inputTime: 100, lastInputTime: 120 });
-  expect(submitted[1]!.options.echo).toBeUndefined();
-  expect(submitted[2]!.options.echo).toBeUndefined();
+  expect(submitted[1]!.options.echo?.intent).toEqual({ kind: 'replaceSelection', payload: { text: 'ㄱ' } });
+  expect(submitted[2]!.options.echo?.intent).toEqual({ kind: 'insertText', payload: { text: '가', replaceBefore: 'ㄱ' } });
   expect(admitIntent(admission, { kind: 'insertText', payload: { text: 'later' } }).status).toBe('held');
   const settled = admission.whenCompositionSettled!();
   const result = admission.settleComposition(reservation.slot, { text: '가', target: reservation.target }, 130);

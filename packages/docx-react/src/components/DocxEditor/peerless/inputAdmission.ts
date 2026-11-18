@@ -291,12 +291,16 @@ export function createInputAdmission(_options: PeerlessInputAdmissionOptions): P
       const fence = tabDirection !== undefined || 'suggesting' in intent.payload || metadata.fence || isSelection(intent) || !isText(intent) ||
         intent.kind === 'paragraphBreak' || intent.kind === 'lineBreak' || intent.kind === 'replaceSelection' ||
         source === 'paste' || source === 'composition';
-      if (fence) {
+      // A composition step is an edit the echo draws like typing; it only keeps other input from merging with it.
+      const step = source === 'composition' && tabDirection === undefined && !('suggesting' in intent.payload) &&
+        (intent.kind === 'insertText' || intent.kind === 'replaceSelection');
+      const fencesEcho = fence && !step;
+      if (fencesEcho) {
         echoFence = source === 'composition' ? undefined : { tickets: [] };
         if (echoDisabledReason !== 'intent-cap') disableEcho('fence');
       }
       barrier = echoFence;
-      if (!fence && echoDisabledReason === 'fence' && barrier) {
+      if (!fencesEcho && echoDisabledReason === 'fence' && barrier) {
         echoTicket = {};
         barrier.tickets.push(echoTicket);
       }
@@ -364,7 +368,7 @@ export function createInputAdmission(_options: PeerlessInputAdmissionOptions): P
         (intent.kind === 'formatRange' && !workerSelection())
         ? defer(after, waitForSelection, send, vertical, false, tabDirection ? () => send(undefined, undefined, true) : undefined)
         : send(after) ?? defer(after, false, () => undefined);
-      if (fence && barrier) barrier.ticket = ticket;
+      if (fencesEcho && barrier) barrier.ticket = ticket;
       track(ticket, isRevision(intent), tabDirection !== undefined);
       if (echoTicket) {
         const entry = echoTicket;
@@ -415,7 +419,7 @@ export function createInputAdmission(_options: PeerlessInputAdmissionOptions): P
     const seq = barrier?.ticket?.seq;
     const contextThroughSeq = echoPainter.contextThroughSeq;
     if (disposed || attachingEcho || echoDisabledReason !== 'fence' || !barrier || seq === undefined ||
-      compositionSlot !== null || readOnly() || contextThroughSeq === undefined ||
+      readOnly() || contextThroughSeq === undefined ||
       seq > throughSeq || contextThroughSeq !== throughSeq || !session.attachEcho) return;
     const tickets: CommandTicket[] = [];
     for (const entry of barrier.tickets) {
@@ -454,7 +458,7 @@ export function createInputAdmission(_options: PeerlessInputAdmissionOptions): P
   const unsubscribeAck = session.subscribeAck?.((ack) => {
     const seq = echoFence?.ticket?.seq;
     if (disposed || attachingEcho || echoDisabledReason !== 'fence' || seq === undefined ||
-      compositionSlot !== null || readOnly() || !session.attachEcho || !ack.echoContext || ack.throughSeq !== seq ||
+      readOnly() || !session.attachEcho || !ack.echoContext || ack.throughSeq !== seq ||
       ack.throughSeq < session.state.throughSeq ||
       !ack.outcomes.some((outcome) => outcome.seq === seq && outcome.status === 'noop')) return;
     if (echoPainter.installAckContext?.(ack.echoContext, seq)) resumeEcho(seq);
@@ -502,7 +506,6 @@ export function createInputAdmission(_options: PeerlessInputAdmissionOptions): P
       if (disposed) throw disposedError();
       if (compositionSlot !== null) throw new Error('Composition is already active');
       viewStore.setProvisionalCaret(null);
-      echoFence = undefined;
       compositionSlot = ++nextSlot;
       notifySelectionActivity(session);
       const target: PeerlessAdmissionTarget = tail
@@ -512,7 +515,7 @@ export function createInputAdmission(_options: PeerlessInputAdmissionOptions): P
       const fence = () => { void session.flush().catch(() => {}); return undefined; };
       if (tail && deferred.has(tail)) defer(tail, false, fence, undefined, true);
       else fence();
-      if (echoDisabledReason !== 'intent-cap') disableEcho('fence');
+      // the steps that follow are edits the echo draws as they go
       return { slot: compositionSlot, target };
     },
     composeText(slot, text, inputTime) {
