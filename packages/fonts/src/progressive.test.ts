@@ -94,8 +94,11 @@ test('a progressive face loads index, skeleton and core, then only the chunks of
   expect(await face.ensureGlyphs([glyphOf(0)])).toBe(1);
   expect(reads).toEqual([]);
 
+  expect(face.chunksOfGlyphs([glyphOf(0)])).toEqual([0]);
+  expect(face.chunksOfGlyphs([glyphOf(41), glyphOf(40), glyphOf(41)]).sort((a, b) => a - b)).toEqual([40, 41]);
   const [first, second] = await Promise.all([face.ensureGlyphs([glyphOf(40)]), face.ensureGlyphs([glyphOf(40), glyphOf(41)])]);
   expect(reads.sort()).toEqual([index.chunks[39]!.file, index.chunks[40]!.file].sort());
+  expect(face.chunksOfGlyphs([glyphOf(40), glyphOf(41)]).every((chunk) => face.loadedChunks().has(chunk))).toBe(true);
   expect(Math.max(first, second)).toBe(face.revision);
   expect(updates.length).toBeGreaterThan(0);
   expect(updates[updates.length - 1]).toBe(face.revision);
@@ -121,6 +124,26 @@ test('a progressive face loads index, skeleton and core, then only the chunks of
   await face.ensureGlyphs(Array.from({ length: skeleton.numGlyphs }, (_, glyph) => glyph));
   expect(face.complete()).toBe(true);
   expect(sha(face.bytes())).toBe(index.sha256);
+});
+
+test('a face loads whole a few chunks at a time and then equals the whole face', async () => {
+  const index = JSON.parse(await Bun.file(new URL(jpRef.index, assets)).text()) as Index;
+  const reads: string[] = [];
+  const face = await openProgressiveFace(jpRef, transport(reads));
+  expect([...face.chunks()].sort((a, b) => a - b)).toEqual(index.chunks.map((chunk) => chunk.id).sort((a, b) => a - b));
+  const [first, second, ...rest] = face.chunks();
+  reads.length = 0;
+  const revision = await face.ensureChunks([first!, second!, first!]);
+  expect(reads.sort()).toEqual([first!, second!].map((id) => index.chunks.find((chunk) => chunk.id === id)!.file).sort());
+  expect(face.revision).toBe(revision);
+  expect(face.complete()).toBe(false);
+  for (let start = 0; start < rest.length; start += 16) await face.ensureChunks(rest.slice(start, start + 16));
+  expect(face.complete()).toBe(true);
+  expect(sha(face.bytes())).toBe(index.sha256);
+  reads.length = 0;
+  expect(await face.ensureChunks(face.chunks())).toBe(face.revision);
+  expect(reads).toEqual([]);
+  await expect(face.ensureChunks([-1])).rejects.toThrow('Unknown font slice chunk -1');
 });
 
 test('a glyph whose chunk loaded during another pending request resolves with a revision that draws it', async () => {
@@ -297,6 +320,29 @@ test('a file URL whose href is a path resolves against this realm, so a worker c
     expect(Object.values(source.urls).every((href) => href.startsWith('https://app.example/_next/static/media/'))).toBe(true);
   } finally {
     if (location) Object.defineProperty(globalThis, 'location', location);
+    else delete (globalThis as { location?: unknown }).location;
+  }
+});
+
+test('a bundler\'s page-relative file URLs reach another realm resolved against the page, and absolute ones stay as they are', async () => {
+  const index = JSON.parse(await Bun.file(new URL(jpRef.index, assets)).text()) as Index;
+  // webpack's `url: 'relative'` (Next) hands out URL-like objects whose `href` is a path on the page's origin.
+  const relative = (file: string) => {
+    const href = `/_next/static/media/${file}`;
+    return { href, toString: () => href } as unknown as URL;
+  };
+  const absolute = (file: string) => new URL(file, 'https://fonts.example/cjk/');
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'location');
+  Object.defineProperty(globalThis, 'location', { value: { href: 'https://app.example/documents/7?tab=1' }, configurable: true });
+  try {
+    const paged = await sliceSourceOf(await openProgressiveFace(jpRef, { ...transport([]), url: async (file) => relative(file) }))!;
+    const chunk = index.chunks[0]!.file;
+    expect(paged.urls[chunk]).toBe(`https://app.example/_next/static/media/${chunk}`);
+    expect(Object.values(paged.urls).every((url) => url.startsWith('https://app.example/_next/static/media/'))).toBe(true);
+    const kept = await sliceSourceOf(await openProgressiveFace(jpRef, { ...transport([]), url: async (file) => absolute(file) }))!;
+    expect(kept.urls[chunk]).toBe(absolute(chunk).href);
+  } finally {
+    if (previous) Object.defineProperty(globalThis, 'location', previous);
     else delete (globalThis as { location?: unknown }).location;
   }
 });
