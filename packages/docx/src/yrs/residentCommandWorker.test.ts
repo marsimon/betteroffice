@@ -107,7 +107,9 @@ function syntheticDocument(headersFooters = false, notes = false, controls = fal
 
 export async function openWorker(options: { collaboration?: boolean; headersFooters?: boolean; layoutWithRegions?: boolean; notes?: boolean; controls?: boolean; propertyImages?: boolean; objects?: boolean; imageMedia?: boolean; bodyXml?: string; sectPr?: string; comments?: string; displayWindow?: [number, number]; factory?: typeof startWorker; prepare?: (engine: Awaited<ReturnType<typeof createResidentEngineSession>>) => { story: string; paraId: string; offset: number }; commentsXml?: string; commentsExtendedXml?: string;
   /** Also registers a Noto Sans KR subset: Liberation Sans falls back to it, and `Noto Sans KR` names it. */
-  korean?: boolean } = {}) {
+  korean?: boolean;
+  /** With `korean`, also a Dotum view of that subset (Dotum's line metrics), which `돋움` names. */
+  dotum?: boolean } = {}) {
   const worker = (options.factory ?? startWorker)(8301);
   const client = options.collaboration ? new DocxSourceWorkerClient(worker) : new ResidentEngineWorkerClient(worker);
   try {
@@ -136,6 +138,8 @@ export async function openWorker(options: { collaboration?: boolean; headersFoot
       fontChains: korean === undefined ? { 'liberation sans|0|0': [fontId] } as Record<string, number[]> : {
         'liberation sans|0|0': [fontId, korean], 'liberation sans|1|0': [fontId, korean],
         'noto sans kr|0|0': [korean, fontId], 'noto sans kr|1|0': [korean, fontId],
+        // the Dotum view registers after both fonts, in the next slot
+        ...options.dotum ? { '돋움|0|0': [2, fontId], '돋움|1|0': [2, fontId] } : {},
       },
     };
     let layoutInput = JSON.stringify({ ...JSON.parse(LAYOUT), measurement });
@@ -160,7 +164,8 @@ export async function openWorker(options: { collaboration?: boolean; headersFoot
     const init: DocxCommandInitRequest = {
       session: 'd1-command-worker', incarnation: 1, epoch: 1, readOnly: false,
       selection: { anchor: point, focus: point },
-      fonts, layoutInput, layoutWithRegions: options.layoutWithRegions ?? true, layoutRevision: 1, extras,
+      fonts: [...fonts, ...options.korean && options.dotum ? [{ substituteOf: 1, family: '돋움' }] : []],
+      layoutInput, layoutWithRegions: options.layoutWithRegions ?? true, layoutRevision: 1, extras,
       ...(options.displayWindow ? { displayWindow: options.displayWindow, retainBuiltPages: false } : {}),
     };
     const initial = await client.commandInit(init);
@@ -3899,6 +3904,32 @@ test('typed Hangul and Latin echo glyph for glyph where the engine then paints t
     expect(await key({ insert: '나' })).toBe(true);
     expect(await key({ insert: 'e' })).toBe(false);
     expect(parity.echoed).toBe(11);
+  } finally { client.destroy(); }
+}, TIMEOUT);
+
+test('Hangul measured through a Dotum view of the face that draws it echoes glyph for glyph', async () => {
+  // Korean documents name a Latin font for Latin text and Dotum for Hangul; the Dotum substitute is
+  // the Korean face with Dotum's line metrics, which the display list draws through the Latin
+  // font's fallback, the face it views
+  const dotum = '<w:rFonts w:ascii="Liberation Sans" w:hAnsi="Liberation Sans" w:eastAsia="돋움"/>';
+  const { client, initial } = await openWorker({ korean: true, dotum: true,
+    bodyXml: `<w:p w14:paraId="00000001"><w:r><w:rPr>${dotum}</w:rPr><w:t xml:space="preserve">가나 echo 한국 text</w:t></w:r></w:p>`,
+    prepare: () => ({ story: 'body', paraId: '00000001', offset: 2 }) });
+  try {
+    const parity = echoParity(client, initial);
+    const { send, key } = parity;
+    await send('insertText', { text: '나' });
+    const glyphs = parity.context?.glyphs;
+    expect(glyphs?.faces?.length).toBeGreaterThan(1);
+    // Hangul takes its line metrics from the view and draws with the face it views
+    const hangul = glyphs!.faces!.find((face) => face.metrics !== face.fontId);
+    expect(hangul).toBeDefined();
+    expect(glyphs!.typed![glyphs!.faces!.indexOf(hangul!)]).toContain('가');
+    for (const edit of [{ insert: '한' }, { insert: 'e' }, { insert: '가' }, { insert: ' ' },
+      { deleteBackward: true as const }, { deleteBackward: true as const }]) {
+      expect(await key(edit)).toBe(true);
+    }
+    expect(parity.echoed).toBe(6);
   } finally { client.destroy(); }
 }, TIMEOUT);
 
