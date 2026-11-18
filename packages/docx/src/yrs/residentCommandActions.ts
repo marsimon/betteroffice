@@ -258,7 +258,7 @@ const DOCX_COMMAND_POLICIES = {
   propose: { keys: reviewCommandKeys.propose, exact: true },
   setProposalStates: { keys: reviewCommandKeys.setProposalStates, exact: true },
   withdrawProposals: { keys: reviewCommandKeys.withdrawProposals, exact: true },
-  select: { keys: ['selection', 'object'] }, insertText: { keys: ['text'] }, replaceSelection: { keys: ['text'] },
+  select: { keys: ['selection', 'object'] }, insertText: { keys: ['text', 'replaceBefore'] }, replaceSelection: { keys: ['text'] },
   navigate: { keys: ['unit', 'direction', 'extend', 'goalX', 'distance'], exact: true },
   navigateCell: { keys: ['direction', 'extend', 'createLastRow'] },
   selectTableCells: { keys: ['target'] },
@@ -385,6 +385,8 @@ function validCommandIntent(
     }
     case 'insertText': case 'replaceSelection':
       if (!string(payload.text) || /[\n\r\u000B\u2028\u2029]/u.test(payload.text)) return refuse('invalid-text');
+      if (payload.replaceBefore !== undefined && (!string(payload.replaceBefore) || payload.replaceBefore === '' ||
+        /[\n\r\u000B\u2028\u2029\uFFFC]/u.test(payload.replaceBefore))) return refuse('invalid-text');
       break;
     case 'deleteBackward': case 'deleteForward':
       if (payload.count !== undefined && (typeof payload.count !== 'number' ||
@@ -455,6 +457,27 @@ function validCommandIntent(
 
 function collapsed(range: YrsStoryRange): boolean {
   return range.start.paraId === range.end.paraId && range.start.offset === range.end.offset;
+}
+
+/**
+ * The range `expected` covers right before a collapsed caret in the caret's paragraph, or null when other text is
+ * there. The caret stays the command's selection, so typing over it keeps the stored formatting.
+ */
+function textRangeBefore(engine: DocxWorkerCommandEngine, range: YrsStoryRange, expected: string): YrsStoryRange | null {
+  const end = range.start;
+  if (!collapsed(range) || end.offset < expected.length) return null;
+  // The caret's paragraph alone: a composition step must not read the whole story.
+  const index = engine.paragraphUnit(range.story, end.paraId);
+  if (index < 0) return null;
+  let text = '';
+  for (const segment of engine.paragraphSegments(range.story, [index])[0] ?? []) {
+    if (text.length >= end.offset) break;
+    text += segment.kind === 'text' ? segment.text : segment.kind === 'pilcrow' ? '\n' : '\uFFFC';
+  }
+  if (text.slice(end.offset - expected.length, end.offset) !== expected) return null;
+  const start = { paraId: end.paraId, offset: end.offset - expected.length };
+  return commandSelectionRange(engine, { anchor: { story: range.story, ...start }, focus: { story: range.story, ...end } })
+    ? { story: range.story, start, end } : null;
 }
 
 function deleteRange(
@@ -771,6 +794,11 @@ export function preflightDocxCommand(
   let range = resolved.range;
   if ((command.kind === 'insertText' || command.kind === 'replaceSelection' || command.kind === 'lineBreak') && state.storedMarks &&
     (typeof state.storedMarks.clear !== 'boolean' || !validDelta(state.storedMarks.delta))) return refuse('invalid-stored-marks');
+  if (command.kind === 'insertText' && command.payload.replaceBefore !== undefined) {
+    const replaced = textRangeBefore(engine, range, command.payload.replaceBefore);
+    if (!replaced) return refuse('replaced-text-mismatch');
+    range = replaced;
+  }
   if (command.kind === 'deleteBackward' || command.kind === 'deleteForward') {
     const story = range.story;
     const segments = new Map<number, YrsStorySegment[]>();
@@ -1253,12 +1281,20 @@ function applyPreparedDocxCommand(
       break;
     }
     case 'insertText': case 'replaceSelection': {
-      const receipt = collapsed(range)
-        ? engine.insertText({ story: range.story, ...range.start }, command.payload.text, command.payload.suggesting)
-        : engine.replaceRange(range, command.payload.text, command.payload.suggesting);
-      if (!receipt.range) throw new Error('Text receipt lacks range');
+      // A composition step that empties the composition removes what it typed (one paragraph).
+      const removal = command.kind === 'insertText' && command.payload.replaceBefore !== undefined && !command.payload.text;
       const stored = state.storedMarks;
-      if (stored && command.payload.text && !collapsed(receipt.range)) {
+      // Text typed with cursor formatting goes in already formatted, as one edit, where the
+      // engine can; otherwise it is typed and then formatted.
+      const marked = stored && !stored.clear && command.payload.text && !command.payload.suggesting &&
+        Object.keys(stored.delta).length && engine.typeWithCaretMarks
+        ? engine.typeWithCaretMarks(range, command.payload.text, stored.delta) : null;
+      const receipt = marked ?? (collapsed(range)
+        ? engine.insertText({ story: range.story, ...range.start }, command.payload.text, command.payload.suggesting)
+        : removal ? engine.deleteRange(range, command.payload.suggesting)
+        : engine.replaceRange(range, command.payload.text, command.payload.suggesting));
+      if (!receipt.range) throw new Error('Text receipt lacks range');
+      if (!marked && stored && command.payload.text && !collapsed(receipt.range)) {
         if (stored.clear) engine.clearFormatting(receipt.range);
         if (Object.keys(stored.delta).length) engine.formatRange(receipt.range, stored.delta);
       }

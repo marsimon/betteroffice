@@ -483,21 +483,35 @@ test('refused_ime_retains_recoverable_draft', async () => {
   expect(editor.textarea.value).toBe('');
 });
 
-test('active_composition_paints_its_preedit_at_the_caret_until_it_commits', async () => {
+test('composition_steps_are_typed_into_the_document_and_the_caret_shows_once_a_frame_covers_them', async () => {
   const editor = await mount();
-  const shown = () => editor.queryByTestId('docx-preedit');
+  const caret = () => editor.container.querySelector<HTMLElement>('[data-docx-caret]');
+  expect(caret()).not.toBeNull();
   preedit(editor.textarea, 'compositionstart');
-  expect(shown()).toBeNull();
+  expect(caret()).toBeNull();
   preedit(editor.textarea, 'compositionupdate', 'ㅎ');
-  expect(shown()?.textContent).toBe('ㅎ');
-  preedit(editor.textarea, 'compositionupdate', '한');
-  expect(shown()?.textContent).toBe('한');
-  expect([shown()!.style.left, shown()!.style.top, shown()!.style.lineHeight]).toEqual(['10px', '0px', '20px']);
-  expect(editor.commands).toEqual([]);
-  preedit(editor.textarea, 'compositionend', '한');
-  expect(shown()).toBeNull();
   await waitFor(() => { expect(editor.commands).toHaveLength(1); });
-  expect(editor.commands[0]!.payload).toMatchObject({ text: '한' });
+  preedit(editor.textarea, 'compositionupdate', '한');
+  await waitFor(() => { expect(editor.commands).toHaveLength(2); });
+  expect(editor.commands.map(({ kind, payload }) => [kind, payload]) as unknown[]).toEqual([
+    ['replaceSelection', { text: 'ㅎ', selection: {
+      anchor: { story: 'body', paraId: 'worker', offset: 0 }, focus: { story: 'body', paraId: 'worker', offset: 0 },
+    } }],
+    ['insertText', { text: '한', replaceBefore: 'ㅎ' }],
+  ]);
+  expect(editor.commands[1]!.afterSeq).toBe(editor.commands[0]!.seq);
+  expect(editor.commands[0]!.inputTime).toBeDefined();
+  expect(editor.commands[1]!.inputTime).toBe(editor.commands[0]!.inputTime);
+  expect(editor.queryByTestId('docx-preedit')).toBeNull();
+  expect(caret()).toBeNull();
+  await editor.acknowledge(0, 'applied');
+  editor.present(frame(2, editor.commands[0]!.seq));
+  expect(caretAt(caret())?.left).toBe('10px');
+  preedit(editor.textarea, 'compositionend', '한');
+  await editor.acknowledge(1, 'applied');
+  expect(editor.commands).toHaveLength(2);
+  expect(editor.binding.admission.getSnapshot().compositionSlot).toBeNull();
+  expect(editor.queryByRole('textbox', { name: 'Recoverable document text' })).toBeNull();
 });
 
 test('synthetic_composition_payload_commits_and_recovers_through_paged_editor', async () => {
@@ -532,15 +546,16 @@ test('delayed_composition_refusal_retains_draft_without_exposing_active_preedit_
   preedit(editor.textarea, 'compositionupdate', '未確定');
   fireEvent.input(editor.textarea, { inputType: 'insertCompositionText', isComposing: true,
     target: { value: '未確定' } });
-  expect(overlays(editor.container)).toEqual(['docx-preedit:未確定']);
+  expect(overlays(editor.container)).toEqual([]);
   await editor.acknowledge(0, 'refused');
   expect((editor.getByRole('textbox', { name: 'Recoverable document text' }) as HTMLTextAreaElement).value).toBe('先');
   editor.present(frame(2, editor.commands[0]!.seq));
   expect(editor.binding.viewStore.getSnapshot().geometry?.frameEpoch).toBe(2);
   expect(editor.binding.admission.getSnapshot().compositionSlot).not.toBeNull();
   expect(editor.textarea.value).toBe('未確定');
-  expect(editor.commands).toHaveLength(1);
-  expect(overlays(editor.container)).toEqual(['docx-preedit:未確定']);
+  expect(editor.commands).toHaveLength(2);
+  expect(editor.commands[1]).toMatchObject({ kind: 'replaceSelection', payload: { text: '未確定' }, afterSeq: editor.commands[0]!.seq });
+  expect(overlays(editor.container)).toEqual([]);
 });
 
 test('recoverable_drafts_remain_until_individually_dismissed', async () => {
@@ -569,7 +584,7 @@ test('recoverable_drafts_remain_until_individually_dismissed', async () => {
   expect(editor.commands).toHaveLength(3);
 });
 
-test('composition_commits_as_one_replace_selection_through_paged_editor', async () => {
+test('composition_steps_then_commit_without_retyping_through_paged_editor', async () => {
   const begin = spyOn(composition, 'beginComposition');
   const update = spyOn(composition, 'updateComposition');
   const end = spyOn(composition, 'endComposition');
@@ -581,20 +596,20 @@ test('composition_commits_as_one_replace_selection_through_paged_editor', async 
   preedit(editor.textarea, 'compositionupdate', '日本語');
   fireEvent.input(editor.textarea, { inputType: 'insertCompositionText', isComposing: true,
     target: { value: '日本語' } });
-  await waitFor(() => { expect(editor.commands).toHaveLength(1); });
+  await waitFor(() => { expect(editor.commands).toHaveLength(3); });
   preedit(editor.textarea, 'compositionend', '日本語');
   beforeinput(editor.textarea, 'insertFromComposition', '日本語');
   fireEvent.input(editor.textarea, { inputType: 'insertFromComposition', target: { value: '日本語' } });
   fireEvent.blur(editor.textarea);
-  await waitFor(() => { expect(editor.commands).toHaveLength(2); });
-  expect(editor.commands.map((command) => command.kind)).toEqual(['insertText', 'replaceSelection']);
-  expect(editor.commands[1]!.payload).toEqual({ text: '日本語' });
+  for (let index = 0; index < 3; index += 1) await editor.acknowledge(index, 'applied');
+  expect(editor.commands.map(({ kind, payload }) => [kind, payload]) as unknown[]).toEqual([
+    ['insertText', { text: 'x' }], ['replaceSelection', { text: 'に' }], ['insertText', { text: '日本語', replaceBefore: 'に' }],
+  ]);
   expect(editor.commands[1]!.afterSeq).toBe(editor.commands[0]!.seq);
+  expect(editor.commands[2]!.afterSeq).toBe(editor.commands[1]!.seq);
   expect(begin).toHaveBeenCalledTimes(1);
   expect(update).toHaveBeenCalled();
   expect(end).toHaveBeenCalledTimes(1);
-  await editor.acknowledge(0, 'applied');
-  await editor.acknowledge(1, 'applied');
   expect(editor.queryByRole('textbox', { name: 'Recoverable document text' })).toBeNull();
 });
 
@@ -624,8 +639,9 @@ test('worker_frame_installs_through_frame_presentation_and_retires_echo', async 
   expect(editor.binding.viewStore.getSnapshot().geometry?.frameEpoch).toBe(2);
   expect(editor.container.querySelector('[data-page-id="1"] canvas')).toBe(editor.canvas);
   expect(editor.textarea.value).toBe('未確定');
-  expect(editor.commands).toHaveLength(1);
-  expect(overlays(editor.container)).toEqual(['docx-preedit:未確定']);
+  await waitFor(() => { expect(editor.commands).toHaveLength(2); });
+  expect(editor.commands[1]).toMatchObject({ kind: 'replaceSelection', payload: { text: '未確定' } });
+  expect(overlays(editor.container)).toEqual([]);
 });
 
 test('worker caret blinks on the hybrid interval only while the input is focused', async () => {

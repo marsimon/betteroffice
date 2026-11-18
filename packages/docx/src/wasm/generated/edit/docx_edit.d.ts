@@ -217,6 +217,12 @@ export class EditSession {
      */
     canvasSkippedEffects(page_index: number, unavailable: Uint32Array): number;
     /**
+     * Whether text typed at `offset` of `para_id` with the cursor formatting
+     * `delta_json` ends with other formatting than text typed there without it;
+     * undefined for a bad or empty delta.
+     */
+    caret_marks_change_typing(story: string, para_id: string, offset: number, delta_json: string): boolean | undefined;
+    /**
      * The current local cell selection as a [`TableRange`], or `"null"`
      * before one is set. An endpoint whose cell was deleted clamps to a
      * surviving nearby cell. Errors when the table itself no longer resolves.
@@ -377,23 +383,44 @@ export class EditSession {
      */
     drain_update_event(): Uint8Array;
     /**
+     * The faces of each character of `alphabet` typed into the laid-out text run
+     * at display position `position`: `{"faces":[[display,measured,metrics],…],
+     * "latin","eastAsia"}`, each face null where that path would not take the
+     * character as plain text; undefined before a region pass or off any text run.
+     */
+    echo_faces_json(position: number, alphabet: string, line_start: number, line_end: number): string | undefined;
+    /**
      * Typing echo model of one font at one shaping size from this session's
      * resident font store: `{"horizontal","glyphIds","advances","kerning",
      * "unsafePairs"}`, indexed by the characters of `alphabet`. `kern` is the
-     * run's kerning gate. Errors for an unknown font or a non-positive size.
+     * run's kerning gate and `language` its BCP-47 shaping language (absent for
+     * none). With `known`, the pairs are only those with a character from
+     * `known` on, for a caller that holds the pairs of the first `known`.
+     * Errors for an unknown font or a non-positive size.
      */
-    echo_glyph_set_json(font_id: number, size: number, kern: boolean, alphabet: string): string;
+    echo_glyph_set_json(font_id: number, size: number, kern: boolean, alphabet: string, language?: string | null, known?: number | null): string;
     /**
      * A plain local text edit that the resident lowering records, so the next
      * [`Self::layout_document_with_regions_after_edit`] re-lowers and
      * re-measures only its paragraph: inserts `text` at the collapsed range,
-     * or deletes `[start, end)` without it. The document changes exactly as
-     * through [`Self::insert_text`] or [`Self::delete_range`] without an
-     * author, and the receipt is theirs. An empty insertion, an edit that
-     * spans paragraphs, or one whose paragraph resident input is not ready
-     * for goes through them instead and records nothing for the relayout.
+     * types it over `[start, end)`, or deletes `[start, end)` without it. The
+     * document changes exactly as through [`Self::insert_text`],
+     * [`Self::replace_range`] or [`Self::delete_range`] without an author,
+     * and the receipt is theirs. An empty text, an edit that spans
+     * paragraphs, or one whose paragraph resident input is not ready for goes
+     * through them instead and records nothing for the relayout.
      */
     edit_text_resident(story: string, start_para: string, start_offset: number, end_para: string, end_offset: number, text?: string | null): string;
+    /**
+     * [`Self::edit_text_resident`] of `text` typed at the cursor with the
+     * cursor formatting `delta_json` (a [`Self::format_range`] delta), as
+     * one edit that leaves what typing it and then formatting it with the
+     * delta would. `undefined`, changing nothing, where it cannot go so (an
+     * empty text, a delta that sets nothing or is refused, an edit that
+     * spans paragraphs or whose paragraph resident input is not ready): the
+     * caller then types and formats it as two edits.
+     */
+    edit_text_resident_marked(story: string, start_para: string, start_offset: number, end_para: string, end_offset: number, text: string, delta_json: string): string | undefined;
     /**
      * [`EditSession::encode_diff`] as ordered updates for a sync that must
      * travel in bounded frames: the whole diff when it fits
@@ -1868,6 +1895,7 @@ export interface InitOutput {
     readonly editsession_can_redo: (a: number) => number;
     readonly editsession_can_undo: (a: number) => number;
     readonly editsession_canvasSkippedEffects: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly editsession_caret_marks_change_typing: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
     readonly editsession_cell_selection: (a: number) => [number, number, number, number];
     readonly editsession_clear_cell_selection: (a: number) => [number, number];
     readonly editsession_clear_content_control_value: (a: number, b: number, c: number) => [number, number];
@@ -1896,8 +1924,10 @@ export interface InitOutput {
     readonly editsession_display_vertical_move_json: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly editsession_document_properties_json: (a: number) => [number, number];
     readonly editsession_drain_update_event: (a: number) => [number, number];
-    readonly editsession_echo_glyph_set_json: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly editsession_echo_faces_json: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
+    readonly editsession_echo_glyph_set_json: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number, number, number];
     readonly editsession_edit_text_resident: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => [number, number, number, number];
+    readonly editsession_edit_text_resident_marked: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];
     readonly editsession_encode_diff: (a: number, b: number, c: number) => [number, number, number, number];
     readonly editsession_encode_diff_chunks: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly editsession_encode_peer_metadata: (a: number) => [number, number, number, number];

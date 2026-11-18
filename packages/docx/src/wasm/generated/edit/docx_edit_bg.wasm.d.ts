@@ -44,6 +44,7 @@ export const editsession_build_display_pages_frame: (a: number, b: number, c: nu
 export const editsession_can_redo: (a: number) => number;
 export const editsession_can_undo: (a: number) => number;
 export const editsession_canvasSkippedEffects: (a: number, b: number, c: number, d: number) => [number, number, number];
+export const editsession_caret_marks_change_typing: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
 export const editsession_cell_selection: (a: number) => [number, number, number, number];
 export const editsession_clear_cell_selection: (a: number) => [number, number];
 export const editsession_clear_content_control_value: (a: number, b: number, c: number) => [number, number];
@@ -72,8 +73,10 @@ export const editsession_display_range_rects_region_json: (a: number, b: number,
 export const editsession_display_vertical_move_json: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
 export const editsession_document_properties_json: (a: number) => [number, number];
 export const editsession_drain_update_event: (a: number) => [number, number];
-export const editsession_echo_glyph_set_json: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+export const editsession_echo_faces_json: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
+export const editsession_echo_glyph_set_json: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number, number, number];
 export const editsession_edit_text_resident: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => [number, number, number, number];
+export const editsession_edit_text_resident_marked: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];
 export const editsession_encode_diff: (a: number, b: number, c: number) => [number, number, number, number];
 export const editsession_encode_diff_chunks: (a: number, b: number, c: number, d: number) => [number, number, number];
 export const editsession_encode_peer_metadata: (a: number) => [number, number, number, number];
