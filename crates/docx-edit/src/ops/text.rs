@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use yrs::types::Attrs;
-use yrs::{Any, Map, MapPrelim, Out, ReadTxn, Text, TextRef, TransactionMut};
+use yrs::{Any, Map, MapPrelim, Out, ReadTxn, Text, TextRef, Transact, TransactionMut};
 
 use crate::format::{CaretMarks, FormatPolicy, HYPERLINK, PROTECTED_ATTRS};
 use crate::op::{LocRange, OpError, OpResult, Receipt, loc_in_bounds, loc_range_in_txn};
@@ -120,6 +120,27 @@ impl EditingDoc {
             Some(key) if self.formatting_keeps_field_paragraph(&key) => None,
             _ => Some(marked),
         }
+    }
+
+    /// Whether text typed at `at` with the cursor's `marks` ends with other formatting than
+    /// text typed there without them: [`Self::caret_marked`] of the formatting the insertion
+    /// point gives typed text. Typing where it is `false` is plain typing.
+    pub(crate) fn caret_marks_change_typing(
+        &self,
+        at: Position,
+        marks: &CaretMarks,
+    ) -> OpResult<bool> {
+        let txn = self.yrs_doc().transact();
+        let story = story_ref(&txn, &at.story)?;
+        check_position(&story, &txn, at.index)?;
+        let mut index = past_leading_blocks_indexed(&story, &txn, at.index, None);
+        let chunks = position_chunks_indexed(&story, &txn, &mut index, None);
+        let formatting = insertion_attrs(&chunks, index, &FormatPolicy::Inherit, &txn);
+        Ok(self
+            .caret_marked(&formatting, marks, || {
+                crate::format::paragraph_key_at(&story, &txn, index)
+            })
+            .is_some())
     }
 }
 

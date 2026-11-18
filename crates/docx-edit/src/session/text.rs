@@ -171,6 +171,30 @@ impl EditSessionCore {
         Ok(Some(text_receipt_json(receipt)))
     }
 
+    /// Whether text typed at `offset` of `para_id` with the cursor formatting `delta_json`
+    /// (an inline format delta) ends with other formatting than text typed there without
+    /// it. `None` for a bad or empty delta, which typing does not take as cursor formatting.
+    pub fn caret_marks_change_typing(
+        &self,
+        story: &str,
+        para_id: &str,
+        offset: u32,
+        delta_json: &str,
+    ) -> EngineResult<Option<bool>> {
+        let at = loc_index(self.engine.doc(), story, para_id, offset)?;
+        let Some(marks) = parse_inline_format_delta(delta_json)
+            .ok()
+            .and_then(|delta| crate::format::CaretMarks::new(&delta))
+        else {
+            return Ok(None);
+        };
+        self.engine
+            .doc()
+            .caret_marks_change_typing(Position::new(story, at), &marks)
+            .map(Some)
+            .map_err(EngineError::message)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn delete_range(
         &self,

@@ -998,6 +998,70 @@ fn styled_document(body: &str) -> Vec<u8> {
 }
 
 #[test]
+fn caret_marks_change_typing_exactly_where_typing_with_them_differs_from_plain_typing() {
+    use crate::Position;
+    let bytes = typed_document();
+    let seeded = || {
+        let engine = EngineSession::new(9303);
+        seed_from_docx(engine.doc(), &bytes).unwrap();
+        engine
+    };
+    let probe = seeded();
+    let cell = probe
+        .doc()
+        .list_stories()
+        .stories
+        .into_iter()
+        .find(|story| story.kind == crate::StoryInfoKind::TableCell)
+        .unwrap()
+        .story;
+    let ctx = EditCtx::local("", "");
+    let mut seen = [false, false];
+    for delta in [
+        json!({"bold": true}),
+        json!({"bold": false}),
+        json!({"italic": true, "fontSize": 9}),
+        json!({"language": {"lang": "de-DE", "eastAsia": null}}),
+    ] {
+        let delta = parse_inline_format_delta(delta.as_object().unwrap()).unwrap();
+        let marks = CaretMarks::new(&delta).unwrap();
+        for story in ["body", cell.as_str()] {
+            let len = probe.doc().story_len(story).unwrap() - 1;
+            for at in 0..=len {
+                let changes = probe
+                    .doc()
+                    .caret_marks_change_typing(Position::new(story, at), &marks)
+                    .unwrap();
+                let plain = seeded();
+                let marked = seeded();
+                let typed = plain.doc().insert_text(
+                    &ctx,
+                    Position::new(story, at),
+                    "x",
+                    FormatPolicy::Inherit,
+                );
+                let with_marks = marked.doc().insert_text_marked_observed(
+                    &ctx,
+                    Position::new(story, at),
+                    "x",
+                    &marks,
+                    |_| {},
+                );
+                assert_eq!(typed.is_ok(), with_marks.is_ok(), "{story} {at} {delta:?}");
+                if typed.is_err() {
+                    continue;
+                }
+                let differs = plain.doc().story_segments(story).unwrap()
+                    != marked.doc().story_segments(story).unwrap();
+                assert_eq!(changes, differs, "{story} {at} {delta:?}");
+                seen[usize::from(changes)] = true;
+            }
+        }
+    }
+    assert_eq!(seen, [true, true], "both answers occur");
+}
+
+#[test]
 fn typing_with_caret_marks_leaves_what_typing_then_formatting_leaves() {
     use crate::Position;
     let bytes = typed_document();

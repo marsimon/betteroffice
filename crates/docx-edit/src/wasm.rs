@@ -1662,6 +1662,21 @@ impl EditSession {
             .map_err(JsValue::from)
     }
 
+    /// Whether text typed at `offset` of `para_id` with the cursor formatting
+    /// `delta_json` ends with other formatting than text typed there without it;
+    /// undefined for a bad or empty delta.
+    pub fn caret_marks_change_typing(
+        &self,
+        story: &str,
+        para_id: &str,
+        offset: u32,
+        delta_json: &str,
+    ) -> Result<Option<bool>, JsValue> {
+        self.core
+            .caret_marks_change_typing(story, para_id, offset, delta_json)
+            .map_err(JsValue::from)
+    }
+
     /// [`Self::edit_text_resident`] of `text` typed at the cursor with the
     /// cursor formatting `delta_json` (a [`Self::format_range`] delta), as
     /// one edit that leaves what typing it and then formatting it with the
