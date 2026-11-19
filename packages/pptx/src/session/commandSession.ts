@@ -55,6 +55,16 @@ export class PptxWorkerUnsupportedError extends Error {
   }
 }
 
+/**
+ * The URL this page fetches the worker's engine from. A bundler can name the asset with a URL-like object whose href
+ * is only the served path (Turbopack compiles `new URL(asset, import.meta.url)` so), which `new URL(href)` rejects;
+ * resolving it against this page's location keeps such hrefs and leaves absolute ones as they are.
+ * @internal
+ */
+export function engineFetchUrl(href: string): URL {
+  return new URL(href, globalThis.location?.href);
+}
+
 /** @internal */
 export function createPptxWorkerSession(
   bytes: Uint8Array | ArrayBuffer, options: PptxWorkerSessionOptions = {},
@@ -67,7 +77,7 @@ export function createPptxWorkerSession(
     preparedWorker ?? createSessionWorker());
   let stopEngineFetch = () => {};
   if (cacheUrl && !wasm && preparedWorker) requestWasmCompile(transport);
-  else if (cacheUrl && !wasm) stopEngineFetch = supplyWasmFetch(transport, new URL(cacheUrl));
+  else if (cacheUrl && !wasm) stopEngineFetch = supplyWasmFetch(transport, engineFetchUrl(cacheUrl));
   const fontCdn = getFontCdnConfiguration();
   const input = {
     ...(fontCdn ? { fontCdn } : {}),
