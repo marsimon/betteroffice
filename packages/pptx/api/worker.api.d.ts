@@ -973,6 +973,11 @@ export type PresentationCommandPayloads = {
         cancelled?: boolean;
         at?: PresentationCommandSelectionReference;
     };
+    compositionUpdate: PresentationCommandTextInput & {
+        compositionId: string;
+        text: string;
+        style?: TextStyle;
+    };
     compositionCommit: PresentationCommandTextInput & {
         compositionId: string;
         text: string;
@@ -1006,6 +1011,7 @@ export declare const PRESENTATION_COMMAND_ADMISSION: Readonly<{
     readonly deleteForward: "local-write";
     readonly paragraphBreak: "local-write";
     readonly compositionStart: "local-write";
+    readonly compositionUpdate: "local-write";
     readonly compositionCommit: "local-write";
     readonly activateSlide: "view";
     readonly selectObject: "view";
@@ -1285,6 +1291,13 @@ export declare class PptxWorkerUnsupportedError extends Error {
     readonly code = "sync-api-unavailable";
     constructor(operation: string, alternative?: string | undefined);
 }
+/**
+ * The URL this page fetches the worker's engine from. A bundler can name the asset with a URL-like object whose href
+ * is only the served path (Turbopack compiles `new URL(asset, import.meta.url)` so), which `new URL(href)` rejects;
+ * resolving it against this page's location keeps such hrefs and leaves absolute ones as they are.
+ * @internal
+ */
+export declare function engineFetchUrl(href: string): URL;
 /** @internal */
 export declare function createPptxWorkerSession(bytes: Uint8Array | ArrayBuffer, options?: PptxWorkerSessionOptions): PptxWorkerSession;
 
