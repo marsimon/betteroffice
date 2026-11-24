@@ -1665,6 +1665,19 @@ impl PrefixScope {
     }
 }
 
+/// The `(prefix, namespace)` an `xmlns` attribute declares; the default namespace has an empty prefix.
+fn namespace_declaration<'a>(
+    (name, value): (&'a String, &'a String),
+) -> Option<(&'a str, &'a str)> {
+    match name.strip_prefix("xmlns") {
+        Some("") => Some(("", value.as_str())),
+        Some(rest) => rest
+            .strip_prefix(':')
+            .map(|prefix| (prefix, value.as_str())),
+        None => None,
+    }
+}
+
 fn scope_name_matching(element: &mut XmlElement, open: &mut [XmlElement], local_names: &mut bool) {
     if !*local_names && rebinds_a_standard_prefix(element) {
         *local_names = true;
