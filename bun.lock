@@ -317,7 +317,7 @@
     },
     "packages/docx": {
       "name": "@betteroffice/docx",
-      "version": "0.5.1-fork.3",
+      "version": "0.5.1-fork.4",
       "dependencies": {
         "@betteroffice/fonts": "workspace:^",
       },
@@ -338,7 +338,7 @@
     },
     "packages/docx-react": {
       "name": "@betteroffice/docx-react",
-      "version": "0.5.1-fork.3",
+      "version": "0.5.1-fork.4",
       "dependencies": {
         "@betteroffice/docx": "workspace:*",
         "@betteroffice/docx-i18n": "workspace:*",
