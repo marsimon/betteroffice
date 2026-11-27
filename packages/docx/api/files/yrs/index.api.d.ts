@@ -58,6 +58,7 @@ export * from './inputPositionMap';
 /** @internal */
 export { subscribeYrsSelection, withYrsSelectionCause, yrsSelectionCause } from './selectionChanges';
 export * from './storyPlainText';
+export * from './cellSelectionFormatting';
 export { tableBoundaryDeleteTarget } from './tableBoundaryDelete';
 export { isCellHasNoStoryRefusal } from './cellRefusal';
 export * from './clipboardFragment';
